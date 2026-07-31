@@ -663,7 +663,7 @@ impl App {
         let k = key.as_ref()?;
         let a = self.agents.get(k)?;
         let m = if a.model.is_empty() { "?" } else { price::model_short(&a.model) };
-        Some((format!("[sa:{}:{}]", m, a.idx), a.idx))
+        Some((format!("[{}:{}]", m, a.idx), a.idx))
     }
 
     pub fn agent_by_idx(&self, idx: usize) -> Option<&AgentInfo> {
@@ -1439,7 +1439,7 @@ impl App {
         }
         if let Some(ctx) = s(v, "hookAdditionalContext") {
             if !ctx.trim().is_empty() {
-                actions.push(("✚ hook injected context".into(), first_line(ctx, 80), 1));
+                actions.push(("✚ hook injected context".into(), ctx.trim().to_string(), 1));
             }
         }
         for (label, detail, sev) in actions {
@@ -1583,7 +1583,7 @@ impl App {
         println!("--- agents ---");
         for k in &self.agent_order {
             if let Some(a) = self.agents.get(k) {
-                println!("sa:{}:{} model={} {}", price::model_short(&a.model), a.idx, a.model, a.desc);
+                println!("{}:{} model={} {}", price::model_short(&a.model), a.idx, a.model, a.desc);
             }
         }
     }

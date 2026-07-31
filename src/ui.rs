@@ -570,9 +570,9 @@ fn filter_label(app: &App) -> String {
                 } else {
                     format!(" {}", truncate_chars(&a.desc, 30))
                 };
-                format!("sa:{m}:{i}{desc}")
+                format!("{m}:{i}{desc}")
             }
-            None => format!("sa:?:{i}"),
+            None => format!("?:{i}"),
         },
     }
 }
