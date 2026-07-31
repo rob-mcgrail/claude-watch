@@ -373,7 +373,7 @@ pub struct App {
     pub hooks_config: Vec<ConfigHook>,
 
     pending: HashMap<String, Pending>,
-    usage_by_msg: HashMap<String, (String, Usage)>,
+    usage_by_msg: HashMap<String, (String, Usage, i64)>,
     pub ctx_tokens: u64,
     pub model: String,
     pub title: String,
@@ -634,7 +634,7 @@ impl App {
 
     pub fn totals(&self) -> Usage {
         let mut t = Usage::default();
-        for (_, u) in self.usage_by_msg.values() {
+        for (_, u, _) in self.usage_by_msg.values() {
             t.input += u.input;
             t.output += u.output;
             t.cache_read += u.cache_read;
@@ -647,8 +647,8 @@ impl App {
     pub fn cost_usd(&self) -> f64 {
         self.usage_by_msg
             .values()
-            .map(|(m, u)| {
-                let (pi, po) = price::prices_usd_per_mtok(m);
+            .map(|(m, u, ts)| {
+                let (pi, po) = price::prices_usd_per_mtok(m, *ts);
                 (u.input as f64 * pi
                     + u.output as f64 * po
                     + u.cache_read as f64 * pi * 0.1
@@ -854,7 +854,7 @@ impl App {
                 uu.c5m = g("cache_creation_input_tokens");
             }
             let model = s(msg, "model").unwrap_or("").to_string();
-            self.usage_by_msg.insert(id.to_string(), (model, uu));
+            self.usage_by_msg.insert(id.to_string(), (model, uu, ts));
             if !sidechain {
                 self.ctx_tokens = uu.input + uu.cache_read + uu.c5m + uu.c1h;
             }
