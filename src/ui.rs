@@ -256,20 +256,28 @@ fn feed_line<'a>(app: &'a App, it: &'a FeedItem) -> Line<'a> {
 fn render_feed(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::Feed, rect));
     let h = inner_h(rect);
-    let total = app.feed.len();
+    let idxs: Vec<usize> = (0..app.feed.len())
+        .filter(|&i| app.agent_passes_filter(&app.feed[i].agent))
+        .collect();
+    let total = idxs.len();
     if app.search.target == PaneId::Feed && app.search.query.is_some() {
-        let texts: Vec<String> = app.feed.iter().map(|it| it.text.to_lowercase()).collect();
+        let texts: Vec<String> =
+            idxs.iter().map(|&i| app.feed[i].text.to_lowercase()).collect();
         engage_search(&mut app.search, &mut app.pending_jump, &texts);
         take_jump(&mut app.scroll, &app.search, &mut app.pending_jump, PaneId::Feed, total, h);
     }
     let (start, end) = window(app, PaneId::Feed, total, h);
     let mut lines: Vec<Line> =
-        app.feed[start..end].iter().map(|it| feed_line(app, it)).collect();
+        idxs[start..end].iter().map(|&i| feed_line(app, &app.feed[i])).collect();
     if app.search.target == PaneId::Feed {
         let cur = app.search.matches.get(app.search.cur).copied();
         highlight_matches(&mut lines, start, &app.search.matches, cur);
     }
-    let title = format!("activity {total}{}", search_suffix(app, PaneId::Feed));
+    let mut title = format!("activity {total}");
+    if !matches!(app.think_filter(), ThinkFilter::All) {
+        title.push_str(&format!(" · {}", filter_label(app)));
+    }
+    title.push_str(&search_suffix(app, PaneId::Feed));
     let block = pane_block(app, PaneId::Feed, title, accent);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -858,7 +866,7 @@ fn render_memory(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::Memory, rect));
     let h = inner_h(rect);
     let width = (rect.width.saturating_sub(2) as usize).max(10);
-    let key = (width, app.mem_rev);
+    let key = (width, app.mem_rev, 0);
     if app.mem_cache.key != key {
         app.mem_cache.key = key;
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -905,7 +913,7 @@ fn render_context(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::Context, rect));
     let h = inner_h(rect);
     let width = (rect.width.saturating_sub(2) as usize).max(10);
-    let key = (width, app.ctx_rev);
+    let key = (width, app.ctx_rev, 0);
     if app.ctx_cache.key != key {
         app.ctx_cache.key = key;
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -994,11 +1002,14 @@ fn render_toolio(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::ToolIO, rect));
     let h = inner_h(rect);
     let width = (rect.width.saturating_sub(2) as usize).max(10);
-    let key = (width, app.tio_rev);
+    let key = (width, app.tio_rev, app.think_filter_pos);
     if app.tio_cache.key != key {
         app.tio_cache.key = key;
         let mut lines: Vec<Line<'static>> = Vec::new();
         for io in &app.tool_ios {
+            if !app.agent_passes_filter(&io.agent) {
+                continue;
+            }
             let (mark, mark_style) = match (&io.output, io.err) {
                 (None, _) => ("⋯", Style::default().fg(Color::Yellow)),
                 (_, true) => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
@@ -1078,11 +1089,16 @@ fn render_toolio(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         let cur = app.search.matches.get(app.search.cur).copied();
         highlight_matches(&mut visible, start, &app.search.matches, cur);
     }
-    let title = format!(
-        "tool i/o · {} calls{}",
-        app.tool_ios.len(),
-        search_suffix(app, PaneId::ToolIO)
-    );
+    let shown = app
+        .tool_ios
+        .iter()
+        .filter(|io| app.agent_passes_filter(&io.agent))
+        .count();
+    let mut title = format!("tool i/o · {shown} calls");
+    if !matches!(app.think_filter(), ThinkFilter::All) {
+        title.push_str(&format!(" · {}", filter_label(app)));
+    }
+    title.push_str(&search_suffix(app, PaneId::ToolIO));
     let block = pane_block(app, PaneId::ToolIO, title, accent);
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }

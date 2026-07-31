@@ -46,7 +46,7 @@ fn main() -> io::Result<()> {
                     "claude-watch — live dashboard for Claude Code sessions in this folder\n\n\
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX] [--dump]\n\n\
                      keys: 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o · 5 context · 6 memory)\n\
-                           tab/shift-tab sessions · </> narrative filter\n\
+                           tab/shift-tab sessions · </> agent filter (narrative, activity, tool i/o)\n\
                            / search focused pane · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
                 );

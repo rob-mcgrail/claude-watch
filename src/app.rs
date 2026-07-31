@@ -295,7 +295,7 @@ pub struct ToolIO {
 /// Rendered-lines cache for the full-screen panes, keyed on (width, revision).
 #[derive(Default)]
 pub struct PaneCache {
-    pub key: (usize, u64),
+    pub key: (usize, u64, usize),
     pub lines: Vec<ratatui::text::Line<'static>>,
     /// lowercased plain text of each line, for search
     pub texts: Vec<String>,
@@ -686,11 +686,23 @@ impl App {
         f[self.think_filter_pos % f.len()]
     }
 
+    pub fn agent_passes_filter(&self, agent: &Option<String>) -> bool {
+        match self.think_filter() {
+            ThinkFilter::All => true,
+            ThinkFilter::Main => agent.is_none(),
+            ThinkFilter::Agent(i) => {
+                self.agent_tag(agent).map(|(_, x)| x == i).unwrap_or(false)
+            }
+        }
+    }
+
     pub fn cycle_think_filter(&mut self, dir: i64) {
         let n = self.think_filters().len() as i64;
         let cur = (self.think_filter_pos as i64) % n;
         self.think_filter_pos = (cur + dir).rem_euclid(n) as usize;
         self.scroll.insert(PaneId::Thinking, 0);
+        self.scroll.insert(PaneId::Feed, 0);
+        self.scroll.insert(PaneId::ToolIO, 0);
     }
 
     pub fn short_path(&self, p: &str) -> String {

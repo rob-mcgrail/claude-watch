@@ -62,7 +62,7 @@ Number keys switch views. `1` **main** (above) — narrative pane, reads/writes/
 |-----|--------|
 | `1`–`6` | switch view |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
-| `<` / `>` | narrative filter: all → main → each subagent |
+| `<` / `>` | agent filter: all → main → each subagent (applies to narrative, activity, and tool i/o) |
 | `/` then `n` / `N` | search the focused pane (activity, narrative, memory, context, tool i/o), jump between matches |
 | arrows / PgUp / PgDn / End | scroll focused pane |
 | mouse | wheel scrolls the pane under the cursor; click focuses |
