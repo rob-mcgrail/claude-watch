@@ -5,8 +5,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{
-    fmt_clock, fmt_dur, fmt_tok, now_ms, tail_truncate, truncate_chars, App, FeedItem, FeedKind,
-    PaneId, Status, TLine, ThinkFilter, ToolStatus,
+    fmt_clock, fmt_dur, fmt_tok, now_ms, tail_truncate, truncate_chars, App, CtxKind, FeedItem,
+    FeedKind, PaneId, Status, TLine, ThinkFilter, ToolStatus,
 };
 
 const AGENT_COLORS: [Color; 6] = [
@@ -36,17 +36,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.pane_rects.clear();
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
     match app.layout {
-        2 => layout_thinking(f, app, rows[0], accent),
-        3 => layout_grid(f, app, rows[0], accent),
+        2 => layout_ops(f, app, rows[0], accent),
+        3 => render_feed(f, app, rows[0], accent),
+        4 => render_memory(f, app, rows[0], accent),
+        5 => render_context(f, app, rows[0], accent),
+        6 => render_toolio(f, app, rows[0], accent),
         _ => layout_default(f, app, rows[0], accent),
     }
     status_bar(f, app, rows[1], status, accent);
 }
 
 fn layout_default(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
-    let main = Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)]).split(area);
+    let main = Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
     let top = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(main[0]);
-    render_feed(f, app, top[0], accent);
+    render_thinking(f, app, top[0], accent);
     let rail = Layout::vertical([
         Constraint::Percentage(26),
         Constraint::Percentage(26),
@@ -58,40 +61,26 @@ fn layout_default(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
     render_writes(f, app, rail[1], accent);
     render_hooks(f, app, rail[2], accent, PaneId::Hooks, false);
     render_skills(f, app, rail[3], accent);
-    render_thinking(f, app, main[1], accent);
+    render_feed(f, app, main[1], accent);
 }
 
-fn layout_thinking(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
-    let cols = Layout::horizontal([
-        Constraint::Percentage(24),
-        Constraint::Percentage(44),
-        Constraint::Percentage(32),
-    ])
-    .split(area);
+/// Ops view: no narrative at all — just the feed and the rail.
+fn layout_ops(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
+    let cols = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).split(area);
+    render_feed(f, app, cols[0], accent);
     let rail = Layout::vertical([
         Constraint::Percentage(26),
         Constraint::Percentage(26),
         Constraint::Percentage(28),
         Constraint::Percentage(20),
     ])
-    .split(cols[0]);
+    .split(cols[1]);
     render_reads(f, app, rail[0], accent);
     render_writes(f, app, rail[1], accent);
     render_hooks(f, app, rail[2], accent, PaneId::Hooks, false);
     render_skills(f, app, rail[3], accent);
-    render_thinking(f, app, cols[1], accent);
-    render_feed(f, app, cols[2], accent);
 }
 
-fn layout_grid(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
-    let rows = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
-    let r0 = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(rows[0]);
-    let r1 = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
-    render_feed(f, app, r0[0], accent);
-    render_thinking(f, app, r0[1], accent);
-    render_files(f, app, r1[0], accent);
-    render_hooks(f, app, r1[1], accent, PaneId::HooksSkills, true);
-}
 
 fn pane_block(app: &App, pane: PaneId, title: String, accent: Color) -> Block<'static> {
     let focused = app.focus == pane;
@@ -121,6 +110,15 @@ fn window(app: &mut App, pane: PaneId, total: usize, h: usize) -> (usize, usize)
 
 fn inner_h(rect: Rect) -> usize {
     rect.height.saturating_sub(2) as usize
+}
+
+fn src_style(src: char) -> Style {
+    match src {
+        '$' => Style::default().fg(Color::Yellow),
+        '@' => Style::default().fg(Color::LightCyan),
+        '±' => Style::default().fg(Color::Magenta),
+        _ => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn feed_line<'a>(app: &'a App, it: &'a FeedItem) -> Line<'a> {
@@ -183,11 +181,21 @@ fn render_reads(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
             spans.push(Span::styled(tag, Style::default().fg(agent_color(idx))));
             spans.push(Span::raw(" "));
         }
+        spans.push(Span::styled(format!("{} ", r.src), src_style(r.src)));
+        used += 2;
         let suffix = if r.count > 1 { format!(" ×{}", r.count) } else { String::new() };
-        let pw = w.saturating_sub(used + suffix.chars().count()).max(8);
-        spans.push(Span::raw(tail_truncate(&r.path, pw)));
+        let err_w = if r.err { 2 } else { 0 };
+        let pw = w.saturating_sub(used + suffix.chars().count() + err_w).max(8);
+        let path_style = if r.err { Style::default().fg(Color::Red) } else { Style::default() };
+        spans.push(Span::styled(tail_truncate(&r.path, pw), path_style));
         if !suffix.is_empty() {
             spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
+        }
+        if r.err {
+            spans.push(Span::styled(
+                " ✗",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -247,59 +255,6 @@ fn write_line<'a>(app: &'a App, e: &'a crate::app::WriteEntry, w: usize) -> Line
         _ => spans.push(Span::styled(" ⋯", Style::default().fg(Color::Yellow))),
     }
     Line::from(spans)
-}
-
-fn render_files(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
-    app.pane_rects.push((PaneId::Files, rect));
-    let h = inner_h(rect);
-    let w = rect.width.saturating_sub(2) as usize;
-
-    enum Row<'a> {
-        R(&'a crate::app::ReadEntry),
-        W(&'a crate::app::WriteEntry),
-    }
-    let total = app.reads.len() + app.writes.len();
-    let (start, end) = window(app, PaneId::Files, total, h);
-    let mut rows: Vec<(i64, Row)> = Vec::new();
-    for r in &app.reads {
-        rows.push((r.ts, Row::R(r)));
-    }
-    for e in &app.writes {
-        rows.push((e.ts, Row::W(e)));
-    }
-    rows.sort_by_key(|(ts, _)| *ts);
-    let mut lines: Vec<Line> = Vec::new();
-    for (_, row) in &rows[start..end] {
-        match row {
-            Row::R(r) => {
-                let mut spans: Vec<Span> = vec![
-                    Span::styled(fmt_clock(r.ts), Style::default().fg(Color::DarkGray)),
-                    Span::raw(" "),
-                    Span::styled("R", Style::default().fg(Color::Cyan)),
-                    Span::raw(" "),
-                ];
-                let mut used = 11;
-                if let Some((tag, idx)) = app.agent_tag(&r.agent) {
-                    used += tag.chars().count() + 1;
-                    spans.push(Span::styled(tag, Style::default().fg(agent_color(idx))));
-                    spans.push(Span::raw(" "));
-                }
-                let suffix = if r.count > 1 { format!(" ×{}", r.count) } else { String::new() };
-                let pw = w.saturating_sub(used + suffix.chars().count()).max(8);
-                spans.push(Span::styled(
-                    tail_truncate(&r.path, pw),
-                    Style::default().fg(Color::Gray),
-                ));
-                if !suffix.is_empty() {
-                    spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
-                }
-                lines.push(Line::from(spans));
-            }
-            Row::W(e) => lines.push(write_line(app, e, w)),
-        }
-    }
-    let block = pane_block(app, PaneId::Files, format!("files {total}"), accent);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn event_short(event: &str) -> &str {
@@ -414,23 +369,26 @@ fn render_hooks(
             "── acted ──",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
+        let w = (rect.width.saturating_sub(4) as usize).max(10);
         for a in &app.hook_actions {
             let style = match a.sev {
                 2 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 _ => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             };
-            let mut spans = vec![
+            lines.push(Line::from(vec![
                 Span::styled(fmt_clock(a.ts), Style::default().fg(Color::DarkGray)),
                 Span::raw(" "),
                 Span::styled(a.label.clone(), style),
-            ];
+            ]));
+            // the response gets its own wrapped lines so it's actually readable
             if !a.detail.is_empty() {
-                spans.push(Span::styled(
-                    format!(" {}", truncate_chars(&a.detail, 60)),
-                    Style::default().fg(Color::Gray),
-                ));
+                for wl in textwrap::wrap(&a.detail, w) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {wl}"),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
             }
-            lines.push(Line::from(spans));
         }
     }
     if with_skills {
@@ -648,6 +606,287 @@ fn highlight_line(text: &str, query: &str, base: Style, is_current: bool) -> Lin
     Line::from(spans)
 }
 
+fn wrap_into(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for raw in text.lines() {
+        if raw.trim().is_empty() {
+            lines.push(Line::default());
+            continue;
+        }
+        for wl in textwrap::wrap(raw, width) {
+            lines.push(Line::from(Span::styled(wl.into_owned(), style)));
+        }
+    }
+}
+
+/// Minimal JSON syntax highlighting: keys cyan, string values green,
+/// everything else dim. Applied per (pre-wrapped) line.
+fn highlight_json_line(line: &str) -> Line<'static> {
+    let punct = Style::default().fg(Color::DarkGray);
+    let key = Style::default().fg(Color::Cyan);
+    let strv = Style::default().fg(Color::Green);
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            if !cur.is_empty() {
+                spans.push(Span::styled(cur.clone(), punct));
+                cur.clear();
+            }
+            let mut sbuf = String::from('"');
+            i += 1;
+            while i < chars.len() {
+                let d = chars[i];
+                sbuf.push(d);
+                if d == '\\' {
+                    if i + 1 < chars.len() {
+                        i += 1;
+                        sbuf.push(chars[i]);
+                    }
+                } else if d == '"' {
+                    break;
+                }
+                i += 1;
+            }
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let is_key = chars.get(j) == Some(&':');
+            spans.push(Span::styled(sbuf, if is_key { key } else { strv }));
+        } else {
+            cur.push(chars[i]);
+        }
+        i += 1;
+    }
+    if !cur.is_empty() {
+        spans.push(Span::styled(cur, punct));
+    }
+    Line::from(spans)
+}
+
+/// Wrap + highlight a tool payload: pretty-printed JSON gets colored,
+/// plain text gets diff-aware styling. Never truncates.
+fn payload_into(lines: &mut Vec<Line<'static>>, text: &str, width: usize, err: bool) {
+    let trimmed = text.trim_start();
+    let as_json = (trimmed.starts_with('{') || trimmed.starts_with('['))
+        .then(|| serde_json::from_str::<serde_json::Value>(text).ok())
+        .flatten()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok());
+    if let Some(pretty) = as_json {
+        for raw in pretty.lines() {
+            for wl in textwrap::wrap(raw, width) {
+                lines.push(highlight_json_line(&wl));
+            }
+        }
+        return;
+    }
+    for raw in text.lines() {
+        let style = if err {
+            Style::default().fg(Color::LightRed)
+        } else if raw.starts_with('+') {
+            Style::default().fg(Color::Green)
+        } else if raw.starts_with('-') {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        if raw.trim().is_empty() {
+            lines.push(Line::default());
+            continue;
+        }
+        for wl in textwrap::wrap(raw, width) {
+            lines.push(Line::from(Span::styled(wl.into_owned(), style)));
+        }
+    }
+}
+
+fn render_memory(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Memory, rect));
+    let h = inner_h(rect);
+    let width = (rect.width.saturating_sub(2) as usize).max(10);
+    let key = (width, app.mem_rev);
+    if app.mem_cache.key != key {
+        app.mem_cache.key = key;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (name, content) in &app.memory_files {
+            lines.push(Line::from(Span::styled(
+                format!("── {name} ──"),
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            )));
+            wrap_into(&mut lines, content, width, Style::default().fg(Color::Gray));
+            lines.push(Line::default());
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no memory files for this project",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        app.mem_cache.lines = lines;
+        // memory reads top-down: anchor to the top on rebuild
+        app.scroll.insert(PaneId::Memory, usize::MAX / 2);
+    }
+    let total = app.mem_cache.lines.len();
+    let (start, end) = window(app, PaneId::Memory, total, h);
+    let visible = app.mem_cache.lines[start..end].to_vec();
+    let title = format!("memory · {} files", app.memory_files.len());
+    let block = pane_block(app, PaneId::Memory, title, accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+fn render_context(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Context, rect));
+    let h = inner_h(rect);
+    let width = (rect.width.saturating_sub(2) as usize).max(10);
+    let key = (width, app.ctx_rev);
+    if app.ctx_cache.key != key {
+        app.ctx_cache.key = key;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for m in &app.ctx {
+            match m.kind {
+                CtxKind::User => {
+                    lines.push(Line::from(Span::styled(
+                        format!("── {} you ──", fmt_clock(m.ts)),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )));
+                    wrap_into(&mut lines, &m.text, width, Style::default());
+                    lines.push(Line::default());
+                }
+                CtxKind::Assistant => {
+                    lines.push(Line::from(Span::styled(
+                        format!("── {} claude ──", fmt_clock(m.ts)),
+                        Style::default().fg(Color::Green),
+                    )));
+                    wrap_into(&mut lines, &m.text, width, Style::default().fg(Color::Gray));
+                    lines.push(Line::default());
+                }
+                CtxKind::Tool => {
+                    lines.push(Line::from(vec![
+                        Span::styled(fmt_clock(m.ts), Style::default().fg(Color::DarkGray)),
+                        Span::raw(" "),
+                        Span::styled(
+                            truncate_chars(&m.text, width.saturating_sub(10)),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                CtxKind::Summary => {
+                    lines.push(Line::from(Span::styled(
+                        format!("══ {} compact summary ══", fmt_clock(m.ts)),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )));
+                    wrap_into(
+                        &mut lines,
+                        &m.text,
+                        width,
+                        Style::default().fg(Color::Yellow),
+                    );
+                    lines.push(Line::default());
+                }
+                CtxKind::Boundary => {
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        format!("══════ {} ══════", m.text),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::default());
+                }
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no context yet",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        app.ctx_cache.lines = lines;
+    }
+    let total = app.ctx_cache.lines.len();
+    let (start, end) = window(app, PaneId::Context, total, h);
+    let visible = app.ctx_cache.lines[start..end].to_vec();
+    let title = format!(
+        "context · {} msgs · {}",
+        app.ctx.len(),
+        fmt_tok(app.ctx_tokens)
+    );
+    let block = pane_block(app, PaneId::Context, title, accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+fn render_toolio(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::ToolIO, rect));
+    let h = inner_h(rect);
+    let width = (rect.width.saturating_sub(2) as usize).max(10);
+    let key = (width, app.tio_rev);
+    if app.tio_cache.key != key {
+        app.tio_cache.key = key;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for io in &app.tool_ios {
+            let (mark, mark_style) = match (&io.output, io.err) {
+                (None, _) => ("⋯", Style::default().fg(Color::Yellow)),
+                (_, true) => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                (_, false) => ("✓", Style::default().fg(Color::Green)),
+            };
+            let mut header: Vec<Span> = vec![
+                Span::styled(
+                    format!("─ {} ", fmt_clock(io.ts)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if let Some((tag, idx)) = app.agent_tag(&io.agent) {
+                header.push(Span::styled(format!("{tag} "), Style::default().fg(agent_color(idx))));
+            }
+            header.push(Span::styled(
+                io.name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            header.push(Span::raw(" "));
+            header.push(Span::styled(mark.to_string(), mark_style));
+            if io.dur_ms > 1000 {
+                header.push(Span::styled(
+                    format!(" {}", fmt_dur(io.dur_ms)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(header));
+            payload_into(&mut lines, &io.input, width, false);
+            match &io.output {
+                None => lines.push(Line::from(Span::styled(
+                    "  ⋯ awaiting result",
+                    Style::default().fg(Color::Yellow),
+                ))),
+                Some(o) if o.is_empty() => lines.push(Line::from(Span::styled(
+                    "  (empty result)",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                Some(o) => {
+                    lines.push(Line::from(Span::styled(
+                        "  ↳ result",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                    payload_into(&mut lines, o, width, io.err);
+                }
+            }
+            lines.push(Line::default());
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no tool calls yet",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        app.tio_cache.lines = lines;
+    }
+    let total = app.tio_cache.lines.len();
+    let (start, end) = window(app, PaneId::ToolIO, total, h);
+    let visible = app.tio_cache.lines[start..end].to_vec();
+    let title = format!("tool i/o · {} calls", app.tool_ios.len());
+    let block = pane_block(app, PaneId::ToolIO, title, accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
 fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent: Color) {
     if let Some(input) = &app.search.input {
         let line = Line::from(vec![
@@ -764,7 +1003,7 @@ fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent:
             norm,
         ),
         Span::styled(" │ ", dim),
-        Span::styled("1-3 layout · ⇥ session · <> think · / find · q", dim),
+        Span::styled("1-6 views · ⇥ session · <> think · / find · q", dim),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), rect);
 }

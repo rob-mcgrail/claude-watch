@@ -150,8 +150,9 @@ pub enum PaneId {
     Hooks,
     Skills,
     Thinking,
-    Files,
-    HooksSkills,
+    Memory,
+    Context,
+    ToolIO,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -194,6 +195,10 @@ pub struct ReadEntry {
     pub agent: Option<String>,
     pub path: String,
     pub count: u32,
+    /// how the content entered context: 'R' Read tool, '$' shell command,
+    /// '@' user-attached file, '±' re-read after external edit
+    pub src: char,
+    pub err: bool,
 }
 
 pub struct WriteEntry {
@@ -260,6 +265,40 @@ pub struct TLine {
     pub header: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum CtxKind {
+    User,
+    Assistant,
+    Tool,
+    Summary,
+    Boundary,
+}
+
+/// One message of the main chain's context window.
+pub struct CtxMsg {
+    pub ts: i64,
+    pub kind: CtxKind,
+    pub text: String,
+}
+
+/// Full, untruncated input/output of one tool call (non file-I/O tools).
+pub struct ToolIO {
+    pub ts: i64,
+    pub agent: Option<String>,
+    pub name: String,
+    pub input: String,
+    pub output: Option<String>,
+    pub err: bool,
+    pub dur_ms: i64,
+}
+
+/// Rendered-lines cache for the full-screen panes, keyed on (width, revision).
+#[derive(Default)]
+pub struct PaneCache {
+    pub key: (usize, u64),
+    pub lines: Vec<ratatui::text::Line<'static>>,
+}
+
 #[derive(Default)]
 pub struct SearchState {
     pub input: Option<String>,
@@ -278,9 +317,12 @@ pub struct Usage {
     pub c1h: u64,
 }
 
+#[derive(Default)]
 struct Pending {
     feed_idx: Option<usize>,
     write_idx: Option<usize>,
+    read_idx: Option<usize>,
+    tio_idx: Option<usize>,
     start_ts: i64,
 }
 
@@ -336,6 +378,19 @@ pub struct App {
     pub pending_jump: Option<usize>,
     pub think_lines: Vec<TLine>,
     pub think_cache_key: (usize, usize, usize, usize),
+
+    // full-screen views
+    pub ctx: Vec<CtxMsg>,
+    pub ctx_rev: u64,
+    pub tool_ios: Vec<ToolIO>,
+    pub tio_rev: u64,
+    pub memory_files: Vec<(String, String)>,
+    pub mem_rev: u64,
+    mem_stamp: (u64, u64),
+    last_mem_check: Instant,
+    pub ctx_cache: PaneCache,
+    pub tio_cache: PaneCache,
+    pub mem_cache: PaneCache,
 }
 
 impl App {
@@ -384,6 +439,17 @@ impl App {
             pending_jump: None,
             think_lines: Vec::new(),
             think_cache_key: (0, 0, 0, 0),
+            ctx: Vec::new(),
+            ctx_rev: 0,
+            tool_ios: Vec::new(),
+            tio_rev: 0,
+            memory_files: Vec::new(),
+            mem_rev: 0,
+            mem_stamp: (0, 0),
+            last_mem_check: Instant::now(),
+            ctx_cache: PaneCache::default(),
+            tio_cache: PaneCache::default(),
+            mem_cache: PaneCache::default(),
         };
         app.sessions = discover::discover_sessions(&app.cwd);
         if !app.sessions.is_empty() {
@@ -432,6 +498,13 @@ impl App {
         self.pending_jump = None;
         self.think_lines.clear();
         self.think_cache_key = (0, 0, 0, 0);
+        self.ctx.clear();
+        self.ctx_rev += 1;
+        self.tool_ios.clear();
+        self.tio_rev += 1;
+        self.memory_files.clear();
+        self.mem_rev += 1;
+        self.mem_stamp = (0, 0);
 
         self.tails = vec![Tail::new(sref.file.clone())];
         self.tailed_agents.clear();
@@ -505,6 +578,10 @@ impl App {
         if self.current_id.is_some() && self.last_sub_scan.elapsed() > Duration::from_secs(1) {
             self.last_sub_scan = Instant::now();
             self.scan_subagents();
+        }
+        if self.layout == 4 && self.last_mem_check.elapsed() > Duration::from_secs(2) {
+            self.last_mem_check = Instant::now();
+            self.load_memory();
         }
         self.drain_tails();
     }
@@ -793,6 +870,9 @@ impl App {
                                 agent: agent.clone(),
                                 text: t.to_string(),
                             });
+                            if agent.is_none() {
+                                self.push_ctx(ts, CtxKind::Assistant, t.to_string());
+                            }
                         }
                     }
                 }
@@ -819,18 +899,39 @@ impl App {
         match name {
             "Read" => {
                 let path = self.short_path(inp("file_path"));
-                if let Some(last) = self.reads.last_mut() {
-                    if last.path == path && last.agent == *agent {
+                let idx = match self.reads.last_mut() {
+                    Some(last) if last.path == path && last.agent == *agent && last.src == 'R' => {
                         last.count += 1;
                         last.ts = ts;
-                        return;
+                        self.reads.len() - 1
                     }
+                    _ => {
+                        self.reads.push(ReadEntry {
+                            ts,
+                            agent: agent.clone(),
+                            path,
+                            count: 1,
+                            src: 'R',
+                            err: false,
+                        });
+                        self.reads.len() - 1
+                    }
+                };
+                self.pending.insert(
+                    id.to_string(),
+                    Pending { read_idx: Some(idx), start_ts: ts, ..Default::default() },
+                );
+                if agent.is_none() {
+                    let p = self.reads[idx].path.clone();
+                    self.push_ctx(ts, CtxKind::Tool, format!("⏺ Read {p}"));
                 }
-                self.reads.push(ReadEntry { ts, agent: agent.clone(), path, count: 1 });
             }
             "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
                 let raw = if name == "NotebookEdit" { inp("notebook_path") } else { inp("file_path") };
                 let path = self.short_path(raw);
+                if agent.is_none() {
+                    self.push_ctx(ts, CtxKind::Tool, format!("⏺ {name} {path}"));
+                }
                 let kind = if name == "Write" { 'W' } else { 'E' };
                 self.writes.push(WriteEntry {
                     ts,
@@ -843,7 +944,11 @@ impl App {
                 });
                 self.pending.insert(
                     id.to_string(),
-                    Pending { feed_idx: None, write_idx: Some(self.writes.len() - 1), start_ts: ts },
+                    Pending {
+                        write_idx: Some(self.writes.len() - 1),
+                        start_ts: ts,
+                        ..Default::default()
+                    },
                 );
             }
             "Skill" => {
@@ -855,10 +960,24 @@ impl App {
                     text.push(' ');
                     text.push_str(&truncate_chars(args, 50));
                 }
+                if agent.is_none() {
+                    self.push_ctx(ts, CtxKind::Tool, text.clone());
+                }
                 let fi = self.push_feed(ts, agent.clone(), text, FeedKind::Skill, ToolStatus::Pending);
+                let ti = self.push_tio(
+                    ts,
+                    agent,
+                    name,
+                    serde_json::to_string_pretty(input).unwrap_or_default(),
+                );
                 self.pending.insert(
                     id.to_string(),
-                    Pending { feed_idx: Some(fi), write_idx: None, start_ts: ts },
+                    Pending {
+                        feed_idx: Some(fi),
+                        tio_idx: Some(ti),
+                        start_ts: ts,
+                        ..Default::default()
+                    },
                 );
             }
             "Task" | "Agent" => {
@@ -873,13 +992,47 @@ impl App {
                 } else {
                     format!("⚑ agent [{st}]: {}", truncate_chars(&desc, 70))
                 };
+                if agent.is_none() {
+                    self.push_ctx(ts, CtxKind::Tool, text.clone());
+                }
                 let fi = self.push_feed(ts, agent.clone(), text, FeedKind::Agent, ToolStatus::Pending);
+                let ti = self.push_tio(
+                    ts,
+                    agent,
+                    name,
+                    serde_json::to_string_pretty(input).unwrap_or_default(),
+                );
                 self.pending.insert(
                     id.to_string(),
-                    Pending { feed_idx: Some(fi), write_idx: None, start_ts: ts },
+                    Pending {
+                        feed_idx: Some(fi),
+                        tio_idx: Some(ti),
+                        start_ts: ts,
+                        ..Default::default()
+                    },
                 );
             }
             _ => {
+                if name == "Bash" {
+                    for p in extract_read_paths(inp("command")) {
+                        let sp = self.short_path(&p);
+                        if let Some(last) = self.reads.last_mut() {
+                            if last.path == sp && last.agent == *agent {
+                                last.count += 1;
+                                last.ts = ts;
+                                continue;
+                            }
+                        }
+                        self.reads.push(ReadEntry {
+                            ts,
+                            agent: agent.clone(),
+                            path: sp,
+                            count: 1,
+                            src: '$',
+                            err: false,
+                        });
+                    }
+                }
                 let (text, kind) = if name == "Bash" {
                     (format!("$ {}", first_line(inp("command"), 130)), FeedKind::Tool)
                 } else if let Some(rest) = name.strip_prefix("mcp__") {
@@ -907,10 +1060,24 @@ impl App {
                     let args = serde_json::to_string(input).unwrap_or_default();
                     (format!("▸ {name} {}", truncate_chars(&args, 60)), FeedKind::Tool)
                 };
+                if agent.is_none() {
+                    self.push_ctx(ts, CtxKind::Tool, text.clone());
+                }
+                let io_input = if name == "Bash" {
+                    inp("command").to_string()
+                } else {
+                    serde_json::to_string_pretty(input).unwrap_or_default()
+                };
                 let fi = self.push_feed(ts, agent.clone(), text, kind, ToolStatus::Pending);
+                let ti = self.push_tio(ts, agent, name, io_input);
                 self.pending.insert(
                     id.to_string(),
-                    Pending { feed_idx: Some(fi), write_idx: None, start_ts: ts },
+                    Pending {
+                        feed_idx: Some(fi),
+                        tio_idx: Some(ti),
+                        start_ts: ts,
+                        ..Default::default()
+                    },
                 );
             }
         }
@@ -920,6 +1087,28 @@ impl App {
         let is_meta = v.get("isMeta").and_then(|x| x.as_bool()).unwrap_or(false);
         let Some(msg) = v.get("message") else { return };
         let content = msg.get("content");
+
+        // post-compaction summary: huge injected user message, not a prompt
+        if v.get("isCompactSummary").and_then(|x| x.as_bool()) == Some(true) {
+            let text = match content {
+                Some(Value::String(t)) => t.clone(),
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|b| s(b, "text"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            self.push_feed(
+                ts,
+                None,
+                "⚠ compact summary injected".into(),
+                FeedKind::Warn,
+                ToolStatus::None,
+            );
+            self.push_ctx(ts, CtxKind::Summary, text);
+            return;
+        }
 
         // plain string content: a prompt, meta command, or agent task prompt
         if let Some(text) = content.and_then(|c| c.as_str()) {
@@ -934,8 +1123,8 @@ impl App {
                 "tool_result" => {
                     let tid = s(block, "tool_use_id").unwrap_or("");
                     let is_err = block.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                    let err_text = if is_err { result_text(block) } else { None };
-                    self.resolve_tool(ts, v, tid, is_err, err_text);
+                    let rtext = result_text(block);
+                    self.resolve_tool(ts, v, tid, is_err, rtext);
                 }
                 "text" => {
                     if let Some(t) = s(block, "text") {
@@ -990,10 +1179,64 @@ impl App {
         }
         let line = format!("❯ {}", first_line(text, 130));
         self.push_feed(ts, None, line, FeedKind::Prompt, ToolStatus::None);
+        self.push_ctx(ts, CtxKind::User, text.to_string());
         if !self.turn_open {
             self.turn_open = true;
             self.turn_start_ts = ts;
         }
+    }
+
+    fn push_ctx(&mut self, ts: i64, kind: CtxKind, text: String) {
+        self.ctx.push(CtxMsg { ts, kind, text });
+        self.ctx_rev += 1;
+    }
+
+    fn push_tio(&mut self, ts: i64, agent: &Option<String>, name: &str, input: String) -> usize {
+        self.tool_ios.push(ToolIO {
+            ts,
+            agent: agent.clone(),
+            name: name.to_string(),
+            input,
+            output: None,
+            err: false,
+            dur_ms: 0,
+        });
+        self.tio_rev += 1;
+        self.tool_ios.len() - 1
+    }
+
+    pub fn load_memory(&mut self) {
+        let Some(sref) = self.sessions.get(self.sel) else { return };
+        let dir = sref.project_dir.join("memory");
+        let mut metas: Vec<(String, PathBuf, u64)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let mtime = e
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                metas.push((name, p, mtime));
+            }
+        }
+        let stamp = (metas.len() as u64, metas.iter().map(|(_, _, m)| m).sum());
+        if stamp == self.mem_stamp {
+            return;
+        }
+        self.mem_stamp = stamp;
+        metas.sort_by_key(|(n, _, _)| (n != "MEMORY.md", n.clone()));
+        self.memory_files = metas
+            .into_iter()
+            .filter_map(|(n, p, _)| fs::read_to_string(&p).ok().map(|c| (n, c)))
+            .collect();
+        self.mem_rev += 1;
     }
 
     fn resolve_tool(
@@ -1002,12 +1245,29 @@ impl App {
         v: &Value,
         tid: &str,
         is_err: bool,
-        err_text: Option<String>,
+        rtext: Option<String>,
     ) {
-        if let Some(t) = &err_text {
-            self.note_hook_block(ts, t);
+        if is_err {
+            if let Some(t) = &rtext {
+                self.note_hook_block(ts, t);
+            }
         }
         let Some(p) = self.pending.remove(tid) else { return };
+        if let Some(ti) = p.tio_idx {
+            if let Some(io) = self.tool_ios.get_mut(ti) {
+                io.output = Some(rtext.clone().unwrap_or_default());
+                io.err = is_err;
+                io.dur_ms = ts - p.start_ts;
+            }
+            self.tio_rev += 1;
+        }
+        if let Some(ri) = p.read_idx {
+            if is_err {
+                if let Some(r) = self.reads.get_mut(ri) {
+                    r.err = true;
+                }
+            }
+        }
         if let Some(wi) = p.write_idx {
             let tur = v.get("toolUseResult");
             let (mut adds, mut dels) = (0u64, 0u64);
@@ -1075,8 +1335,8 @@ impl App {
         stat.acted += 1;
         stat.last_ts = ts;
         let label = format!("⛔ {event} blocked · {name}");
-        let detail = first_line(msg, 110);
-        let feed_text = format!("{label}: {}", truncate_chars(&detail, 60));
+        let detail = msg.trim().to_string();
+        let feed_text = format!("{label}: {}", first_line(msg, 60));
         self.push_feed(ts, None, feed_text, FeedKind::Warn, ToolStatus::None);
         self.hook_actions.push(HookAction { ts, label, detail, sev: 2 });
     }
@@ -1098,13 +1358,16 @@ impl App {
                 }
             }
             "compact_boundary" => {
-                self.push_feed(
-                    ts,
-                    None,
-                    "⚠ context compacted".into(),
-                    FeedKind::Warn,
-                    ToolStatus::None,
-                );
+                let md = v.get("compactMetadata");
+                let g = |k: &str| md.and_then(|m| m.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
+                let (pre, post) = (g("preTokens"), g("postTokens"));
+                let text = if pre > 0 {
+                    format!("⚠ context compacted ({} → {})", fmt_tok(pre), fmt_tok(post))
+                } else {
+                    "⚠ context compacted".to_string()
+                };
+                self.push_feed(ts, None, text.clone(), FeedKind::Warn, ToolStatus::None);
+                self.push_ctx(ts, CtxKind::Boundary, text);
             }
             _ => {}
         }
@@ -1190,6 +1453,24 @@ impl App {
                 let text = format!("✗ hook error: {}", truncate_chars(&detail, 70));
                 self.push_feed(ts, None, text, FeedKind::Warn, ToolStatus::None);
             }
+            "file" => {
+                let path = s(att, "displayPath").or_else(|| s(att, "filename")).unwrap_or("");
+                if !path.is_empty() {
+                    let sp = self.short_path(path);
+                    self.reads.push(ReadEntry {
+                        ts, agent: None, path: sp, count: 1, src: '@', err: false,
+                    });
+                }
+            }
+            "edited_text_file" => {
+                let path = s(att, "filename").unwrap_or("");
+                if !path.is_empty() {
+                    let sp = self.short_path(path);
+                    self.reads.push(ReadEntry {
+                        ts, agent: None, path: sp, count: 1, src: '±', err: false,
+                    });
+                }
+            }
             "plan_mode" => {
                 self.push_feed(ts, None, "· entered plan mode".into(), FeedKind::Info, ToolStatus::None);
             }
@@ -1265,6 +1546,103 @@ impl App {
     }
 }
 
+/// Split a shell command into pipeline/list segments of whitespace tokens,
+/// respecting single/double quotes so quoted filters stay one token.
+fn shell_segments(cmd: &str) -> Vec<Vec<String>> {
+    let mut segs: Vec<Vec<String>> = Vec::new();
+    let mut seg: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                }
+                '|' | ';' | '&' | '\n' => {
+                    if !cur.is_empty() {
+                        seg.push(std::mem::take(&mut cur));
+                    }
+                    if !seg.is_empty() {
+                        segs.push(std::mem::take(&mut seg));
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        seg.push(std::mem::take(&mut cur));
+                    }
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    if !cur.is_empty() {
+        seg.push(cur);
+    }
+    if !seg.is_empty() {
+        segs.push(seg);
+    }
+    segs
+}
+
+/// Best-effort extraction of file paths a shell command reads into context.
+fn extract_read_paths(cmd: &str) -> Vec<String> {
+    const DIRECT: [&str; 6] = ["cat", "head", "tail", "bat", "less", "more"];
+    const PATTERN_FIRST: [&str; 3] = ["grep", "rg", "jq"];
+    let mut out: Vec<String> = Vec::new();
+    for toks in shell_segments(cmd) {
+        let Some(first) = toks.first() else { continue };
+        let prog = first.rsplit('/').next().unwrap_or(first);
+        let mut pattern_pending = PATTERN_FIRST.contains(&prog);
+        if !DIRECT.contains(&prog) && !pattern_pending {
+            continue;
+        }
+        for t in &toks[1..] {
+            if t.starts_with('>') || t.starts_with('<') {
+                break;
+            }
+            // embedded redirects like 2>/dev/null, 2>&1 are not paths
+            if t.contains('>') || t.contains('<') {
+                continue;
+            }
+            if t.starts_with('-') || t.starts_with('$') || t.starts_with('`') || t.starts_with('(')
+            {
+                continue;
+            }
+            if t.starts_with("/dev/") || t.starts_with("/proc/") {
+                continue;
+            }
+            if pattern_pending {
+                pattern_pending = false;
+                continue;
+            }
+            if t.len() < 3 {
+                continue;
+            }
+            let looks_like_path =
+                t.contains('/') || std::path::Path::new(t.as_str()).extension().is_some();
+            if looks_like_path {
+                out.push(t.clone());
+                if out.len() >= 6 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn load_hook_config(cwd: &Path) -> Vec<ConfigHook> {
     let mut out: Vec<ConfigHook> = Vec::new();
     let paths = [
@@ -1305,4 +1683,30 @@ fn load_hook_config(cwd: &Path) -> Vec<ConfigHook> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_shell_read_paths() {
+        assert_eq!(
+            extract_read_paths("cat src/main.rs 2>/dev/null | grep foo"),
+            vec!["src/main.rs".to_string()]
+        );
+        // pattern args are not paths; redirects are not paths
+        assert_eq!(
+            extract_read_paths("jq -r '.type | select(. != null)' logs/session.jsonl 2>/dev/null"),
+            vec!["logs/session.jsonl".to_string()]
+        );
+        assert_eq!(
+            extract_read_paths("grep -rl 'foo/bar' --include='*.rs' src/app.rs"),
+            vec!["src/app.rs".to_string()]
+        );
+        // writes, devices and command output are not reads
+        assert!(extract_read_paths("cat notes.txt > out.txt").len() == 1);
+        assert!(extract_read_paths("echo hi 2>/dev/null").is_empty());
+        assert!(extract_read_paths("cargo build 2>&1").is_empty());
+    }
 }

@@ -45,7 +45,8 @@ fn main() -> io::Result<()> {
                 println!(
                     "claude-watch — live dashboard for Claude Code sessions in this folder\n\n\
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX] [--dump]\n\n\
-                     keys: 1-3 layouts · tab/shift-tab sessions · </> thinking filter\n\
+                     keys: 1-6 views (1 main · 2 ops · 3 activity · 4 memory · 5 context · 6 tool i/o)\n\
+                           tab/shift-tab sessions · </> narrative filter\n\
                            / search thinking · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
                 );
@@ -155,7 +156,23 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         KeyCode::BackTab => app.next_session(-1),
         KeyCode::Char('1') => app.layout = 1,
         KeyCode::Char('2') => app.layout = 2,
-        KeyCode::Char('3') => app.layout = 3,
+        KeyCode::Char('3') => {
+            app.layout = 3;
+            app.focus = PaneId::Feed;
+        }
+        KeyCode::Char('4') => {
+            app.layout = 4;
+            app.focus = PaneId::Memory;
+            app.load_memory();
+        }
+        KeyCode::Char('5') => {
+            app.layout = 5;
+            app.focus = PaneId::Context;
+        }
+        KeyCode::Char('6') => {
+            app.layout = 6;
+            app.focus = PaneId::ToolIO;
+        }
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
         KeyCode::Char('/') => {
