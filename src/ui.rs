@@ -348,6 +348,15 @@ fn render_hooks(
             }
             None => (0, 0, 0),
         };
+        // Only Stop-family hooks log their (passing) runs to the transcript;
+        // for the rest a zero count means "unobservable", not "never ran".
+        let runs_logged = matches!(c.event.as_str(), "Stop" | "SubagentStop");
+        let active = count > 0 || acted > 0;
+        let count_label = if count == 0 && !runs_logged {
+            " ×–".to_string()
+        } else {
+            format!(" ×{count}")
+        };
         let mut spans = vec![
             Span::styled(
                 format!("{:<6}", event_short(&c.event)),
@@ -355,10 +364,10 @@ fn render_hooks(
             ),
             Span::styled(
                 c.name.clone(),
-                if count > 0 { Style::default() } else { Style::default().fg(Color::DarkGray) },
+                if active { Style::default() } else { Style::default().fg(Color::DarkGray) },
             ),
             Span::styled(
-                format!(" ×{count}"),
+                count_label,
                 if count > 0 {
                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {

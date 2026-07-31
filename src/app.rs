@@ -74,6 +74,14 @@ pub fn tail_truncate(s: &str, max: usize) -> String {
     format!("…{t}")
 }
 
+fn result_text(block: &Value) -> Option<String> {
+    match block.get("content") {
+        Some(Value::String(t)) => Some(t.clone()),
+        Some(Value::Array(a)) => a.iter().find_map(|b| s(b, "text").map(str::to_string)),
+        _ => None,
+    }
+}
+
 fn parse_ts(v: &Value) -> Option<i64> {
     v.get("timestamp")?
         .as_str()
@@ -926,7 +934,8 @@ impl App {
                 "tool_result" => {
                     let tid = s(block, "tool_use_id").unwrap_or("");
                     let is_err = block.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
-                    self.resolve_tool(ts, v, tid, is_err);
+                    let err_text = if is_err { result_text(block) } else { None };
+                    self.resolve_tool(ts, v, tid, is_err, err_text);
                 }
                 "text" => {
                     if let Some(t) = s(block, "text") {
@@ -987,7 +996,17 @@ impl App {
         }
     }
 
-    fn resolve_tool(&mut self, ts: i64, v: &Value, tid: &str, is_err: bool) {
+    fn resolve_tool(
+        &mut self,
+        ts: i64,
+        v: &Value,
+        tid: &str,
+        is_err: bool,
+        err_text: Option<String>,
+    ) {
+        if let Some(t) = &err_text {
+            self.note_hook_block(ts, t);
+        }
         let Some(p) = self.pending.remove(tid) else { return };
         if let Some(wi) = p.write_idx {
             let tur = v.get("toolUseResult");
@@ -1033,6 +1052,33 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Tool/prompt hooks that PASS are never logged to the transcript; the
+    /// only trace is a denial baked into an error tool_result, shaped like:
+    /// `PreToolUse:Bash hook error: [bash …/guard.sh]: Blocked by guard: …`
+    fn note_hook_block(&mut self, ts: i64, text: &str) {
+        let Some(pos) = text.find(" hook error: [") else { return };
+        let event = text[..pos].to_string();
+        let rest = &text[pos + " hook error: [".len()..];
+        let Some(close) = rest.find("]:") else { return };
+        let bracket = &rest[..close];
+        let msg = rest[close + 2..].trim();
+        let (key, name) = match self.hooks_config.iter().find(|c| bracket.contains(&c.name)) {
+            Some(c) => (
+                c.status_message.clone().unwrap_or_else(|| c.command.clone()),
+                c.name.clone(),
+            ),
+            None => (truncate_chars(bracket, 40), truncate_chars(bracket, 28)),
+        };
+        let stat = self.hook_stats.entry(key).or_default();
+        stat.acted += 1;
+        stat.last_ts = ts;
+        let label = format!("⛔ {event} blocked · {name}");
+        let detail = first_line(msg, 110);
+        let feed_text = format!("{label}: {}", truncate_chars(&detail, 60));
+        self.push_feed(ts, None, feed_text, FeedKind::Warn, ToolStatus::None);
+        self.hook_actions.push(HookAction { ts, label, detail, sev: 2 });
     }
 
     fn apply_system(&mut self, ts: i64, v: &Value, sidechain: bool) {
