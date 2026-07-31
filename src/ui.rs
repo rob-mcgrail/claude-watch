@@ -4,10 +4,110 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
+use std::collections::HashMap;
+
 use crate::app::{
     fmt_clock, fmt_dur, fmt_tok, now_ms, tail_truncate, truncate_chars, App, CtxKind, FeedItem,
-    FeedKind, PaneId, Status, TLine, ThinkFilter, ToolStatus,
+    FeedKind, PaneId, SearchState, Status, TLine, ThinkFilter, ToolStatus,
 };
+
+pub fn pane_label(p: PaneId) -> &'static str {
+    match p {
+        PaneId::Feed => "activity",
+        PaneId::Thinking => "narrative",
+        PaneId::Memory => "memory",
+        PaneId::Context => "context",
+        PaneId::ToolIO => "tool i/o",
+        PaneId::Reads => "reads",
+        PaneId::Writes => "writes",
+        PaneId::Hooks => "hooks",
+        PaneId::Skills => "skills",
+    }
+}
+
+/// Recompute matches for the search target from its display-line texts.
+fn engage_search(search: &mut SearchState, pending_jump: &mut Option<usize>, texts: &[String]) {
+    search.matches.clear();
+    let Some(q) = &search.query else { return };
+    let ql = q.to_lowercase();
+    for (i, t) in texts.iter().enumerate() {
+        if t.contains(&ql) {
+            search.matches.push(i);
+        }
+    }
+    if search.jump_pending {
+        search.jump_pending = false;
+        if !search.matches.is_empty() {
+            search.cur = search.matches.len() - 1;
+            *pending_jump = Some(search.matches[search.cur]);
+        }
+    }
+    if search.cur >= search.matches.len() {
+        search.cur = search.matches.len().saturating_sub(1);
+    }
+}
+
+/// Consume a pending search jump by scrolling the target pane to the line.
+fn take_jump(
+    scroll: &mut HashMap<PaneId, usize>,
+    search: &SearchState,
+    pending_jump: &mut Option<usize>,
+    pane: PaneId,
+    total: usize,
+    h: usize,
+) {
+    if search.target != pane {
+        return;
+    }
+    if let Some(idx) = pending_jump.take() {
+        let off = total
+            .saturating_sub(idx + h / 2 + 1)
+            .min(total.saturating_sub(h));
+        scroll.insert(pane, off);
+    }
+}
+
+fn search_suffix(app: &App, pane: PaneId) -> String {
+    if app.search.target != pane {
+        return String::new();
+    }
+    match &app.search.query {
+        None => String::new(),
+        Some(q) => {
+            if app.search.matches.is_empty() {
+                format!(" · \"{q}\" no matches")
+            } else {
+                format!(" · \"{q}\" {}/{}", app.search.cur + 1, app.search.matches.len())
+            }
+        }
+    }
+}
+
+/// Reverse-video the matched lines in the visible slice; current match in yellow.
+fn highlight_matches(visible: &mut [Line<'_>], start: usize, matches: &[usize], cur: Option<usize>) {
+    if matches.is_empty() {
+        return;
+    }
+    for (i, line) in visible.iter_mut().enumerate() {
+        let gi = start + i;
+        if matches.binary_search(&gi).is_ok() {
+            let st = if cur == Some(gi) {
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            };
+            *line = std::mem::take(line).patch_style(st);
+        }
+    }
+}
+
+fn line_text_lower(l: &Line<'_>) -> String {
+    l.spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+        .to_lowercase()
+}
 
 const AGENT_COLORS: [Color; 6] = [
     Color::LightMagenta,
@@ -157,9 +257,20 @@ fn render_feed(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::Feed, rect));
     let h = inner_h(rect);
     let total = app.feed.len();
+    if app.search.target == PaneId::Feed && app.search.query.is_some() {
+        let texts: Vec<String> = app.feed.iter().map(|it| it.text.to_lowercase()).collect();
+        engage_search(&mut app.search, &mut app.pending_jump, &texts);
+        take_jump(&mut app.scroll, &app.search, &mut app.pending_jump, PaneId::Feed, total, h);
+    }
     let (start, end) = window(app, PaneId::Feed, total, h);
-    let lines: Vec<Line> = app.feed[start..end].iter().map(|it| feed_line(app, it)).collect();
-    let block = pane_block(app, PaneId::Feed, format!("activity {total}"), accent);
+    let mut lines: Vec<Line> =
+        app.feed[start..end].iter().map(|it| feed_line(app, it)).collect();
+    if app.search.target == PaneId::Feed {
+        let cur = app.search.matches.get(app.search.cur).copied();
+        highlight_matches(&mut lines, start, &app.search.matches, cur);
+    }
+    let title = format!("activity {total}{}", search_suffix(app, PaneId::Feed));
+    let block = pane_block(app, PaneId::Feed, title, accent);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
@@ -500,34 +611,31 @@ fn render_thinking(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         }
     }
 
-    // search matches
-    app.search.matches.clear();
-    if let Some(q) = app.search.query.clone() {
-        let ql = q.to_lowercase();
-        for (i, l) in app.think_lines.iter().enumerate() {
-            if !l.header && l.text.to_lowercase().contains(&ql) {
-                app.search.matches.push(i);
+    // search matches (only when this pane is the search target)
+    if app.search.target == PaneId::Thinking {
+        app.search.matches.clear();
+        if let Some(q) = app.search.query.clone() {
+            let ql = q.to_lowercase();
+            for (i, l) in app.think_lines.iter().enumerate() {
+                if !l.header && l.text.to_lowercase().contains(&ql) {
+                    app.search.matches.push(i);
+                }
             }
-        }
-        if app.search.jump_pending {
-            app.search.jump_pending = false;
-            if !app.search.matches.is_empty() {
-                app.search.cur = app.search.matches.len() - 1;
-                app.pending_jump = Some(app.search.matches[app.search.cur]);
+            if app.search.jump_pending {
+                app.search.jump_pending = false;
+                if !app.search.matches.is_empty() {
+                    app.search.cur = app.search.matches.len() - 1;
+                    app.pending_jump = Some(app.search.matches[app.search.cur]);
+                }
             }
-        }
-        if app.search.cur >= app.search.matches.len() {
-            app.search.cur = app.search.matches.len().saturating_sub(1);
+            if app.search.cur >= app.search.matches.len() {
+                app.search.cur = app.search.matches.len().saturating_sub(1);
+            }
         }
     }
 
     let total = app.think_lines.len();
-    if let Some(idx) = app.pending_jump.take() {
-        let off = total
-            .saturating_sub(idx + h / 2 + 1)
-            .min(total.saturating_sub(h));
-        app.scroll.insert(PaneId::Thinking, off);
-    }
+    take_jump(&mut app.scroll, &app.search, &mut app.pending_jump, PaneId::Thinking, total, h);
     let (start, end) = window(app, PaneId::Thinking, total, h);
 
     let cur_match_line = app
@@ -536,7 +644,11 @@ fn render_thinking(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         .get(app.search.cur)
         .copied()
         .unwrap_or(usize::MAX);
-    let query = app.search.query.clone();
+    let query = if app.search.target == PaneId::Thinking {
+        app.search.query.clone()
+    } else {
+        None
+    };
     let mut lines: Vec<Line> = Vec::new();
     for (i, l) in app.think_lines[start..end].iter().enumerate() {
         let gi = start + i;
@@ -556,17 +668,7 @@ fn render_thinking(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
 
     let mut title = format!("narrative · {}", filter_label(app));
-    if let Some(q) = &app.search.query {
-        if app.search.matches.is_empty() {
-            title.push_str(&format!(" · \"{q}\" no matches"));
-        } else {
-            title.push_str(&format!(
-                " · \"{q}\" {}/{}",
-                app.search.cur + 1,
-                app.search.matches.len()
-            ));
-        }
-    }
+    title.push_str(&search_suffix(app, PaneId::Thinking));
     let block = pane_block(app, PaneId::Thinking, title, accent);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -724,14 +826,27 @@ fn render_memory(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        app.mem_cache.texts = lines.iter().map(line_text_lower).collect();
         app.mem_cache.lines = lines;
         // memory reads top-down: anchor to the top on rebuild
         app.scroll.insert(PaneId::Memory, usize::MAX / 2);
     }
     let total = app.mem_cache.lines.len();
+    if app.search.target == PaneId::Memory && app.search.query.is_some() {
+        engage_search(&mut app.search, &mut app.pending_jump, &app.mem_cache.texts);
+        take_jump(&mut app.scroll, &app.search, &mut app.pending_jump, PaneId::Memory, total, h);
+    }
     let (start, end) = window(app, PaneId::Memory, total, h);
-    let visible = app.mem_cache.lines[start..end].to_vec();
-    let title = format!("memory · {} files", app.memory_files.len());
+    let mut visible = app.mem_cache.lines[start..end].to_vec();
+    if app.search.target == PaneId::Memory {
+        let cur = app.search.matches.get(app.search.cur).copied();
+        highlight_matches(&mut visible, start, &app.search.matches, cur);
+    }
+    let title = format!(
+        "memory · {} files{}",
+        app.memory_files.len(),
+        search_suffix(app, PaneId::Memory)
+    );
     let block = pane_block(app, PaneId::Memory, title, accent);
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
@@ -801,15 +916,25 @@ fn render_context(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        app.ctx_cache.texts = lines.iter().map(line_text_lower).collect();
         app.ctx_cache.lines = lines;
     }
     let total = app.ctx_cache.lines.len();
+    if app.search.target == PaneId::Context && app.search.query.is_some() {
+        engage_search(&mut app.search, &mut app.pending_jump, &app.ctx_cache.texts);
+        take_jump(&mut app.scroll, &app.search, &mut app.pending_jump, PaneId::Context, total, h);
+    }
     let (start, end) = window(app, PaneId::Context, total, h);
-    let visible = app.ctx_cache.lines[start..end].to_vec();
+    let mut visible = app.ctx_cache.lines[start..end].to_vec();
+    if app.search.target == PaneId::Context {
+        let cur = app.search.matches.get(app.search.cur).copied();
+        highlight_matches(&mut visible, start, &app.search.matches, cur);
+    }
     let title = format!(
-        "context · {} msgs · {}",
+        "context · {} msgs · {}{}",
         app.ctx.len(),
-        fmt_tok(app.ctx_tokens)
+        fmt_tok(app.ctx_tokens),
+        search_suffix(app, PaneId::Context)
     );
     let block = pane_block(app, PaneId::Context, title, accent);
     f.render_widget(Paragraph::new(visible).block(block), rect);
@@ -877,12 +1002,25 @@ fn render_toolio(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        app.tio_cache.texts = lines.iter().map(line_text_lower).collect();
         app.tio_cache.lines = lines;
     }
     let total = app.tio_cache.lines.len();
+    if app.search.target == PaneId::ToolIO && app.search.query.is_some() {
+        engage_search(&mut app.search, &mut app.pending_jump, &app.tio_cache.texts);
+        take_jump(&mut app.scroll, &app.search, &mut app.pending_jump, PaneId::ToolIO, total, h);
+    }
     let (start, end) = window(app, PaneId::ToolIO, total, h);
-    let visible = app.tio_cache.lines[start..end].to_vec();
-    let title = format!("tool i/o · {} calls", app.tool_ios.len());
+    let mut visible = app.tio_cache.lines[start..end].to_vec();
+    if app.search.target == PaneId::ToolIO {
+        let cur = app.search.matches.get(app.search.cur).copied();
+        highlight_matches(&mut visible, start, &app.search.matches, cur);
+    }
+    let title = format!(
+        "tool i/o · {} calls{}",
+        app.tool_ios.len(),
+        search_suffix(app, PaneId::ToolIO)
+    );
     let block = pane_block(app, PaneId::ToolIO, title, accent);
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
@@ -891,7 +1029,7 @@ fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent:
     if let Some(input) = &app.search.input {
         let line = Line::from(vec![
             Span::styled(
-                " search: ",
+                format!(" search {}: ", pane_label(app.search.target)),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),

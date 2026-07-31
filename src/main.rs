@@ -176,8 +176,28 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
         KeyCode::Char('/') => {
+            let searchable = matches!(
+                app.focus,
+                PaneId::Feed | PaneId::Thinking | PaneId::Memory | PaneId::Context | PaneId::ToolIO
+            );
+            let target = if searchable {
+                app.focus
+            } else {
+                match app.layout {
+                    4 => PaneId::Memory,
+                    5 => PaneId::Context,
+                    6 => PaneId::ToolIO,
+                    _ => PaneId::Feed,
+                }
+            };
+            if app.search.target != target {
+                app.search.query = None;
+                app.search.matches.clear();
+                app.search.cur = 0;
+            }
+            app.search.target = target;
             app.search.input = Some(String::new());
-            app.focus = PaneId::Thinking;
+            app.focus = target;
         }
         KeyCode::Esc => {
             app.search.query = None;
@@ -186,7 +206,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             if !app.search.matches.is_empty() {
                 app.search.cur = (app.search.cur + 1) % app.search.matches.len();
                 app.pending_jump = Some(app.search.matches[app.search.cur]);
-                app.focus = PaneId::Thinking;
+                app.focus = app.search.target;
             }
         }
         KeyCode::Char('N') => {
@@ -194,7 +214,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
                 let n = app.search.matches.len();
                 app.search.cur = (app.search.cur + n - 1) % n;
                 app.pending_jump = Some(app.search.matches[app.search.cur]);
-                app.focus = PaneId::Thinking;
+                app.focus = app.search.target;
             }
         }
         KeyCode::Up => scroll_by(app, app.focus, 1),

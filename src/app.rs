@@ -297,15 +297,31 @@ pub struct ToolIO {
 pub struct PaneCache {
     pub key: (usize, u64),
     pub lines: Vec<ratatui::text::Line<'static>>,
+    /// lowercased plain text of each line, for search
+    pub texts: Vec<String>,
 }
 
-#[derive(Default)]
 pub struct SearchState {
     pub input: Option<String>,
     pub query: Option<String>,
+    /// which pane the query applies to
+    pub target: PaneId,
     pub matches: Vec<usize>,
     pub cur: usize,
     pub jump_pending: bool,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            input: None,
+            query: None,
+            target: PaneId::Thinking,
+            matches: Vec::new(),
+            cur: 0,
+            jump_pending: false,
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -792,18 +808,8 @@ impl App {
                     self.push_feed(ts, None, text, FeedKind::Info, ToolStatus::None);
                 }
             }
-            "mode" => {
-                if let Some(m) = s(v, "mode") {
-                    let text = format!("· mode → {m}");
-                    self.push_feed(ts, None, text, FeedKind::Info, ToolStatus::None);
-                }
-            }
-            "permission-mode" => {
-                if let Some(m) = s(v, "permissionMode") {
-                    let text = format!("· permissions → {m}");
-                    self.push_feed(ts, None, text, FeedKind::Info, ToolStatus::None);
-                }
-            }
+            // "mode" / "permission-mode" entries are rewritten constantly by
+            // Claude Code — pure noise in the feed, so they are not shown.
             "ai-title" => {
                 if let Some(t) = s(v, "aiTitle") {
                     self.title = t.to_string();
