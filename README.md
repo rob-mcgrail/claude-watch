@@ -35,17 +35,17 @@ Number keys switch views. `1` **main** (above) — narrative pane, reads/writes/
 
 ![activity view](screenshots/view-3-activity.png)
 
-`4` **memory** — the project's memory files, live-reloading:
+`4` **tool i/o** — every Bash/MCP/agent call with **full, untruncated** input and result, JSON pretty-printed and highlighted:
 
-![memory view](screenshots/view-4-memory.png)
+![tool i/o view](screenshots/view-6-tool-io.png)
 
 `5` **context** — the session's context window as a scrollable document: prompts and replies in full, tool one-liners, compaction boundaries with pre→post token counts, and injected compact summaries:
 
 ![context view](screenshots/view-5-context.png)
 
-`6` **tool i/o** — every Bash/MCP/agent call with **full, untruncated** input and result, JSON pretty-printed and highlighted:
+`6` **memory** — the project's memory files, live-reloading:
 
-![tool i/o view](screenshots/view-6-tool-io.png)
+![memory view](screenshots/view-4-memory.png)
 
 ## What it shows
 

@@ -138,9 +138,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.layout {
         2 => layout_ops(f, app, rows[0], accent),
         3 => render_feed(f, app, rows[0], accent),
-        4 => render_memory(f, app, rows[0], accent),
+        4 => render_toolio(f, app, rows[0], accent),
         5 => render_context(f, app, rows[0], accent),
-        6 => render_toolio(f, app, rows[0], accent),
+        6 => render_memory(f, app, rows[0], accent),
         _ => layout_default(f, app, rows[0], accent),
     }
     status_bar(f, app, rows[1], status, accent);

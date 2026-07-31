@@ -595,7 +595,7 @@ impl App {
             self.last_sub_scan = Instant::now();
             self.scan_subagents();
         }
-        if self.layout == 4 && self.last_mem_check.elapsed() > Duration::from_secs(2) {
+        if self.layout == 6 && self.last_mem_check.elapsed() > Duration::from_secs(2) {
             self.last_mem_check = Instant::now();
             self.load_memory();
         }

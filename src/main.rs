@@ -45,9 +45,9 @@ fn main() -> io::Result<()> {
                 println!(
                     "claude-watch — live dashboard for Claude Code sessions in this folder\n\n\
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX] [--dump]\n\n\
-                     keys: 1-6 views (1 main · 2 ops · 3 activity · 4 memory · 5 context · 6 tool i/o)\n\
+                     keys: 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o · 5 context · 6 memory)\n\
                            tab/shift-tab sessions · </> narrative filter\n\
-                           / search thinking · n/N matches · arrows/pgup/pgdn scroll\n\
+                           / search focused pane · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
                 );
                 return Ok(());
@@ -162,8 +162,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         }
         KeyCode::Char('4') => {
             app.layout = 4;
-            app.focus = PaneId::Memory;
-            app.load_memory();
+            app.focus = PaneId::ToolIO;
         }
         KeyCode::Char('5') => {
             app.layout = 5;
@@ -171,7 +170,8 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         }
         KeyCode::Char('6') => {
             app.layout = 6;
-            app.focus = PaneId::ToolIO;
+            app.focus = PaneId::Memory;
+            app.load_memory();
         }
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
@@ -184,9 +184,9 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
                 app.focus
             } else {
                 match app.layout {
-                    4 => PaneId::Memory,
+                    4 => PaneId::ToolIO,
                     5 => PaneId::Context,
-                    6 => PaneId::ToolIO,
+                    6 => PaneId::Memory,
                     _ => PaneId::Feed,
                 }
             };
