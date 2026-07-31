@@ -737,10 +737,22 @@ impl App {
         self.feed.len() - 1
     }
 
-    /// Context window estimate: bump to the next known tier if observed
-    /// context exceeds the configured window (e.g. 1M-context sessions).
+    /// Context window estimate. Window sizes are not recorded in transcripts,
+    /// so: per-model default (Fable sessions observably auto-compact at ~1M),
+    /// bumped to the next real tier if observed context exceeds it.
+    /// --context-window overrides the default.
     pub fn effective_window(&self) -> u64 {
-        [self.ctx_window, 500_000, 1_000_000, 2_000_000]
+        let model_default = if self.model.to_ascii_lowercase().contains("fable") {
+            1_000_000
+        } else {
+            200_000
+        };
+        let base = self.ctx_window.max(if self.ctx_window == 200_000 {
+            model_default
+        } else {
+            0
+        });
+        [base, 1_000_000, 2_000_000]
             .into_iter()
             .find(|t| self.ctx_tokens <= *t)
             .unwrap_or(2_000_000)

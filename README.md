@@ -2,42 +2,17 @@
 
 A live terminal dashboard for [Claude Code](https://claude.com/claude-code) sessions. Run it in any project folder and it tails the most recent session's transcript — including every subagent — and shows you what's actually going on.
 
-```
-┌ activity ──────────────────────┬ reads ─────────────────────┐
-│ 13:12:01 $ cargo build ✓       │ src/main.rs                │
-│ 13:12:04 [sa:fable:1] ▸ grep … │ src/session.rs             │
-│ 13:12:09 ⚑ agent: audit deps ⋯ ├ writes ────────────────────┤
-│ 13:12:11 ◇ haunt·run {...} ✓   │ src/ui.rs      +42 −7      │
-│                                ├ hooks ─────────────────────┤
-│                                │ stop  lazy-stop ×12 58ms   │
-│                                │ ── acted ──                │
-│                                │ 13:02 ✋ hook cancelled     │
-│                                ├ skills ────────────────────┤
-│                                │ /model ×1                  │
-├ narrative ─────────────────────┴────────────────────────────┤
-│ ── 13:12:01 [main] ──                                       │
-│ The tests fail because the offset is computed before…       │
-├─────────────────────────────────────────────────────────────┤
-│ ⚡ WORKING 2m14s │ in 45.2k · out 3.1k │ NZ$3.42 │ ctx 38%   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## What it shows
-
-- **activity** — chronological feed of prompts, replies, Bash commands, MCP calls, web fetches, and agent spawns, with success/failure markers and durations. Subagent activity is merged in with colored `[sa:model:n]` tags.
-- **reads / writes** — file paths as they're touched; writes carry `+adds −dels` diffstats.
-- **hooks** — every configured hook with run counts and average duration, plus a sticky **acted** buffer for the moments a hook actually intervened (blocked a stop, errored, injected context, got cancelled).
-- **skills** — slash commands and Skill invocations, sticky for the whole session.
-- **narrative** — the assistant's full prose, main agent and subagents interleaved, scrollable and searchable. (Thinking text is never persisted to disk by Claude Code — every thinking block is stored as an empty string plus signature — so prose is the closest persisted layer. If a future version persists thinking, it will appear here automatically.)
-- **status bar** — token totals, session cost in NZD at API rates, and a context-window gauge.
-
-The whole frame changes color with session state: **green** working, **amber** waiting for your input, **red** stalled (usually a permission prompt).
+![main view: narrative, reads/writes/hooks/skills rail, activity feed](screenshots/view-1-main.png)
 
 ## Install
 
+macOS (Apple Silicon), one command — downloads the release binary, clears the quarantine flag, installs to `~/.local/bin`:
+
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/rob-mcgrail/claude-watch/master/install-macos.sh | bash
 ```
+
+Or from source (needs Rust): `git clone https://github.com/rob-mcgrail/claude-watch && cd claude-watch && ./install.sh`
 
 ## Use
 
@@ -46,9 +21,46 @@ cd some-project        # a folder with a Claude Code session
 claude-watch
 ```
 
+The whole frame changes color with session state: **green** working, **amber** waiting for your input, **red** stalled (usually a permission prompt).
+
+## The six views
+
+Number keys switch views. `1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
+
+`2` **ops** — activity + rail, no narrative:
+
+![ops view](screenshots/view-2-ops.png)
+
+`3` **activity** — just the feed, full screen (shown here in amber waiting-for-input state):
+
+![activity view](screenshots/view-3-activity.png)
+
+`4` **memory** — the project's memory files, live-reloading:
+
+![memory view](screenshots/view-4-memory.png)
+
+`5` **context** — the session's context window as a scrollable document: prompts and replies in full, tool one-liners, compaction boundaries with pre→post token counts, and injected compact summaries:
+
+![context view](screenshots/view-5-context.png)
+
+`6` **tool i/o** — every Bash/MCP/agent call with **full, untruncated** input and result, JSON pretty-printed and highlighted:
+
+![tool i/o view](screenshots/view-6-tool-io.png)
+
+## What it shows
+
+- **activity** — chronological feed of prompts, replies, Bash commands, MCP calls, web fetches, and agent spawns, with success/failure markers and durations. Subagent activity is merged in with colored `[sa:model:n]` tags.
+- **reads / writes** — file paths as content enters or leaves context. Reads carry a source marker: `R` Read tool, `$` shell command (`cat`/`head`/`tail`/`jq`/`grep`/`rg`, parsed quote-aware), `@` user-attached file, `±` re-read after an external edit. Writes carry `+adds −dels` diffstats. Both scroll back through the whole session.
+- **hooks** — every configured hook with run counts and average duration (`×–` where Claude Code doesn't log runs), plus a sticky **acted** buffer for the moments a hook actually intervened — blocked a tool call, blocked a stop, errored, injected context — with the hook's full response.
+- **skills** — slash commands and Skill invocations, sticky for the whole session.
+- **narrative** — the assistant's full prose, main agent and subagents interleaved, scrollable and searchable, filterable per-agent. (Thinking text is never persisted to disk by Claude Code — every thinking block is stored as an empty string plus signature — so prose is the closest persisted layer. If a future version persists thinking, it will appear here automatically.)
+- **status bar** — token totals, session cost in NZD at API rates, and a context-window gauge (window size is estimated per model — Fable sessions observably run 1M — and auto-adjusts if usage exceeds it).
+
+## Keys
+
 | key | action |
 |-----|--------|
-| `1` `2` `3` | switch layout (feed-major / narrative-major / grid) |
+| `1`–`6` | switch view |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
 | `<` / `>` | narrative filter: all → main → each subagent |
 | `/` then `n` / `N` | search the narrative, jump between matches |
