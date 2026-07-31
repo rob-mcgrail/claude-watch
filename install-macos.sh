@@ -15,7 +15,7 @@ if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
 fi
 
 mkdir -p "$DEST"
-echo "downloading latest $ASSET…"
+echo "downloading latest ${ASSET}..."
 curl -fsSL "https://github.com/$REPO/releases/latest/download/$ASSET" -o "$BIN"
 chmod +x "$BIN"
 
