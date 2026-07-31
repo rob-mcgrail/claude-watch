@@ -112,7 +112,7 @@ Do not preamble. Do not explain unless denying."
   # --no-session-persistence: this fires on every Bash tool call, and each
   # judging subprocess would otherwise write a throwaway session to disk and
   # clutter the user's resumable-session list. Needs --print, which -p is.
-  verdict="$(printf '%s' "$prompt" | claude -p --no-session-persistence --model claude-haiku-4-5-20251001 2>/dev/null | head -n1)"
+  verdict="$(printf '%s' "$prompt" | claude -p --no-session-persistence --model haiku 2>/dev/null | head -n1)"
 
   # Cache the verdict (only if non-empty — empty implies API/network failure
   # and we don't want to memoize "I couldn't reach the model").
@@ -135,7 +135,7 @@ fi
 # than to silently wave through a command the guard never actually saw.
 if [ -z "$verdict" ]; then
   {
-    echo "Blocked by unrestricted-bash-guard: empty verdict from \`claude -p\` (model: claude-haiku-4-5-20251001)."
+    echo "Blocked by unrestricted-bash-guard: empty verdict from \`claude -p\` (model: haiku)."
     echo "  The guard couldn't reach the model to evaluate this command — failing closed."
     echo "  Likely cause: network blip, claude CLI not on PATH, transient API failure."
     echo "  Command:  $command"
