@@ -768,6 +768,52 @@ fn highlight_json_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+
+/// Lightweight shell highlighting: command words bold, strings green,
+/// flags cyan, operators magenta, variables yellow.
+fn highlight_bash_line(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut expect_cmd = true;
+    let mut in_quote: Option<char> = None;
+    for (i, tok) in line.split_whitespace().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let st = if let Some(q) = in_quote {
+            if tok.matches(q).count() % 2 == 1 {
+                in_quote = None;
+            }
+            Style::default().fg(Color::Green)
+        } else if matches!(tok, "|" | "||" | "&&" | ";" | ">" | ">>" | "<" | "<<" | "2>&1" | "&") {
+            expect_cmd = true;
+            spans.push(Span::styled(tok.to_string(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+            continue;
+        } else {
+            for qc in ['\'', '"'] {
+                if tok.matches(qc).count() % 2 == 1 {
+                    in_quote = Some(qc);
+                }
+            }
+            if tok.starts_with('#') {
+                Style::default().fg(Color::DarkGray)
+            } else if tok.starts_with('\'') || tok.starts_with('"') || in_quote.is_some() {
+                Style::default().fg(Color::Green)
+            } else if expect_cmd {
+                expect_cmd = false;
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else if tok.starts_with('-') && tok.len() > 1 {
+                Style::default().fg(Color::Cyan)
+            } else if tok.starts_with('$') {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            }
+        };
+        spans.push(Span::styled(tok.to_string(), st));
+    }
+    Line::from(spans)
+}
+
 /// Wrap + highlight a tool payload: pretty-printed JSON gets colored,
 /// plain text gets diff-aware styling. Never truncates.
 fn payload_into(lines: &mut Vec<Line<'static>>, text: &str, width: usize, err: bool) {
@@ -791,6 +837,10 @@ fn payload_into(lines: &mut Vec<Line<'static>>, text: &str, width: usize, err: b
             Style::default().fg(Color::Green)
         } else if raw.starts_with('-') {
             Style::default().fg(Color::Red)
+        } else if raw.starts_with("error") || raw.contains("error[") {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else if raw.starts_with("warning") {
+            Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -976,7 +1026,19 @@ fn render_toolio(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
                 ));
             }
             lines.push(Line::from(header));
-            payload_into(&mut lines, &io.input, width, false);
+            if io.name == "Bash" {
+                for raw in io.input.lines() {
+                    if raw.trim().is_empty() {
+                        lines.push(Line::default());
+                        continue;
+                    }
+                    for wl in textwrap::wrap(raw, width) {
+                        lines.push(highlight_bash_line(&wl));
+                    }
+                }
+            } else {
+                payload_into(&mut lines, &io.input, width, false);
+            }
             match &io.output {
                 None => lines.push(Line::from(Span::styled(
                     "  ⋯ awaiting result",
