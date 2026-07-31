@@ -805,7 +805,8 @@ impl App {
                 if s(v, "operation") == Some("enqueue") {
                     let content = s(v, "content").unwrap_or("");
                     let text = format!("⧗ queued: {}", first_line(content, 100));
-                    self.push_feed(ts, None, text, FeedKind::Info, ToolStatus::None);
+                    // queued input is user input — style it like a prompt
+                    self.push_feed(ts, None, text, FeedKind::Prompt, ToolStatus::None);
                 }
             }
             // "mode" / "permission-mode" entries are rewritten constantly by
@@ -1452,13 +1453,25 @@ impl App {
         let Some(att) = v.get("attachment") else { return };
         match s(att, "type").unwrap_or("") {
             "hook_cancelled" => {
-                self.hook_actions.push(HookAction {
-                    ts,
-                    label: "✋ hook cancelled".into(),
-                    detail: String::new(),
-                    sev: 1,
-                });
-                self.push_feed(ts, None, "✋ hook cancelled".into(), FeedKind::Warn, ToolStatus::None);
+                let name = s(att, "hookName").unwrap_or("hook").to_string();
+                let cmd = s(att, "command").unwrap_or("").to_string();
+                let timed_out = att.get("timedOut").and_then(|x| x.as_bool()).unwrap_or(false);
+                let dur = att.get("durationMs").and_then(|x| x.as_u64()).unwrap_or(0) as i64;
+                let verb = if timed_out { "timed out" } else { "cancelled" };
+                let label = format!("✋ {name} {verb}");
+                let detail = if timed_out {
+                    let limit = att.get("timeoutMs").and_then(|x| x.as_u64()).unwrap_or(0);
+                    format!("hit its {} timeout — tool call proceeded without it", fmt_dur(limit as i64))
+                } else {
+                    format!("cancelled after {}", fmt_dur(dur))
+                };
+                if !cmd.is_empty() {
+                    let stat = self.hook_stats.entry(cmd).or_default();
+                    stat.acted += 1;
+                    stat.last_ts = ts;
+                }
+                self.hook_actions.push(HookAction { ts, label: label.clone(), detail, sev: 1 });
+                self.push_feed(ts, None, label, FeedKind::Warn, ToolStatus::None);
             }
             "hook_non_blocking_error" => {
                 let detail = s(att, "error").or_else(|| s(att, "message")).unwrap_or("").to_string();
