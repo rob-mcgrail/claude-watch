@@ -1,0 +1,787 @@
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::Frame;
+
+use crate::app::{
+    fmt_clock, fmt_dur, fmt_tok, now_ms, tail_truncate, truncate_chars, App, FeedItem, FeedKind,
+    PaneId, Status, TLine, ThinkFilter, ToolStatus,
+};
+
+const AGENT_COLORS: [Color; 6] = [
+    Color::LightMagenta,
+    Color::LightBlue,
+    Color::LightGreen,
+    Color::LightYellow,
+    Color::LightRed,
+    Color::Cyan,
+];
+
+pub fn agent_color(idx: usize) -> Color {
+    AGENT_COLORS[(idx.saturating_sub(1)) % AGENT_COLORS.len()]
+}
+
+fn accent_color(status: Status) -> Color {
+    match status {
+        Status::Working => Color::Green,
+        Status::Waiting => Color::Yellow,
+        Status::Blocked => Color::Red,
+    }
+}
+
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let status = app.status();
+    let accent = accent_color(status);
+    app.pane_rects.clear();
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
+    match app.layout {
+        2 => layout_thinking(f, app, rows[0], accent),
+        3 => layout_grid(f, app, rows[0], accent),
+        _ => layout_default(f, app, rows[0], accent),
+    }
+    status_bar(f, app, rows[1], status, accent);
+}
+
+fn layout_default(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
+    let main = Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)]).split(area);
+    let top = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(main[0]);
+    render_feed(f, app, top[0], accent);
+    let rail = Layout::vertical([
+        Constraint::Percentage(26),
+        Constraint::Percentage(26),
+        Constraint::Percentage(28),
+        Constraint::Percentage(20),
+    ])
+    .split(top[1]);
+    render_reads(f, app, rail[0], accent);
+    render_writes(f, app, rail[1], accent);
+    render_hooks(f, app, rail[2], accent, PaneId::Hooks, false);
+    render_skills(f, app, rail[3], accent);
+    render_thinking(f, app, main[1], accent);
+}
+
+fn layout_thinking(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
+    let cols = Layout::horizontal([
+        Constraint::Percentage(24),
+        Constraint::Percentage(44),
+        Constraint::Percentage(32),
+    ])
+    .split(area);
+    let rail = Layout::vertical([
+        Constraint::Percentage(26),
+        Constraint::Percentage(26),
+        Constraint::Percentage(28),
+        Constraint::Percentage(20),
+    ])
+    .split(cols[0]);
+    render_reads(f, app, rail[0], accent);
+    render_writes(f, app, rail[1], accent);
+    render_hooks(f, app, rail[2], accent, PaneId::Hooks, false);
+    render_skills(f, app, rail[3], accent);
+    render_thinking(f, app, cols[1], accent);
+    render_feed(f, app, cols[2], accent);
+}
+
+fn layout_grid(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
+    let rows = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    let r0 = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(rows[0]);
+    let r1 = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
+    render_feed(f, app, r0[0], accent);
+    render_thinking(f, app, r0[1], accent);
+    render_files(f, app, r1[0], accent);
+    render_hooks(f, app, r1[1], accent, PaneId::HooksSkills, true);
+}
+
+fn pane_block(app: &App, pane: PaneId, title: String, accent: Color) -> Block<'static> {
+    let focused = app.focus == pane;
+    let mut b = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent));
+    if focused {
+        b = b.border_type(BorderType::Thick);
+    }
+    let mut style = Style::default().fg(accent);
+    if focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    b.title(Span::styled(format!(" {title} "), style))
+}
+
+fn window(app: &mut App, pane: PaneId, total: usize, h: usize) -> (usize, usize) {
+    let off = app.scroll.entry(pane).or_insert(0);
+    let max_off = total.saturating_sub(h);
+    if *off > max_off {
+        *off = max_off;
+    }
+    let end = total - *off;
+    let start = end.saturating_sub(h);
+    (start, end)
+}
+
+fn inner_h(rect: Rect) -> usize {
+    rect.height.saturating_sub(2) as usize
+}
+
+fn feed_line<'a>(app: &'a App, it: &'a FeedItem) -> Line<'a> {
+    let mut spans: Vec<Span> = vec![
+        Span::styled(fmt_clock(it.ts), Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ];
+    if let Some((tag, idx)) = app.agent_tag(&it.agent) {
+        spans.push(Span::styled(tag, Style::default().fg(agent_color(idx))));
+        spans.push(Span::raw(" "));
+    }
+    let style = match it.kind {
+        FeedKind::Prompt => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        FeedKind::Reply => Style::default().fg(Color::Gray),
+        FeedKind::Tool => Style::default(),
+        FeedKind::Mcp => Style::default().fg(Color::Magenta),
+        FeedKind::Skill => Style::default().fg(Color::LightBlue),
+        FeedKind::Agent => Style::default().fg(Color::LightCyan),
+        FeedKind::Info => Style::default().fg(Color::DarkGray),
+        FeedKind::Warn => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    };
+    spans.push(Span::styled(it.text.as_str(), style));
+    match it.status {
+        ToolStatus::Pending => spans.push(Span::styled(" ⋯", Style::default().fg(Color::Yellow))),
+        ToolStatus::Ok => spans.push(Span::styled(" ✓", Style::default().fg(Color::Green))),
+        ToolStatus::Err => spans.push(Span::styled(
+            " ✗",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        ToolStatus::None => {}
+    }
+    Line::from(spans)
+}
+
+fn render_feed(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Feed, rect));
+    let h = inner_h(rect);
+    let total = app.feed.len();
+    let (start, end) = window(app, PaneId::Feed, total, h);
+    let lines: Vec<Line> = app.feed[start..end].iter().map(|it| feed_line(app, it)).collect();
+    let block = pane_block(app, PaneId::Feed, format!("activity {total}"), accent);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn render_reads(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Reads, rect));
+    let h = inner_h(rect);
+    let w = rect.width.saturating_sub(2) as usize;
+    let total = app.reads.len();
+    let (start, end) = window(app, PaneId::Reads, total, h);
+    let mut lines: Vec<Line> = Vec::new();
+    for r in &app.reads[start..end] {
+        let mut spans: Vec<Span> = vec![
+            Span::styled(fmt_clock(r.ts), Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+        ];
+        let mut used = 9;
+        if let Some((tag, idx)) = app.agent_tag(&r.agent) {
+            used += tag.chars().count() + 1;
+            spans.push(Span::styled(tag, Style::default().fg(agent_color(idx))));
+            spans.push(Span::raw(" "));
+        }
+        let suffix = if r.count > 1 { format!(" ×{}", r.count) } else { String::new() };
+        let pw = w.saturating_sub(used + suffix.chars().count()).max(8);
+        spans.push(Span::raw(tail_truncate(&r.path, pw)));
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
+        }
+        lines.push(Line::from(spans));
+    }
+    let block = pane_block(app, PaneId::Reads, format!("reads {total}"), accent);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn render_writes(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Writes, rect));
+    let h = inner_h(rect);
+    let w = rect.width.saturating_sub(2) as usize;
+    let total = app.writes.len();
+    let (start, end) = window(app, PaneId::Writes, total, h);
+    let mut lines: Vec<Line> = Vec::new();
+    for e in &app.writes[start..end] {
+        lines.push(write_line(app, e, w));
+    }
+    let block = pane_block(app, PaneId::Writes, format!("writes {total}"), accent);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn write_line<'a>(app: &'a App, e: &'a crate::app::WriteEntry, w: usize) -> Line<'a> {
+    let mut spans: Vec<Span> = vec![
+        Span::styled(fmt_clock(e.ts), Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ];
+    let mut used = 9;
+    if let Some((tag, idx)) = app.agent_tag(&e.agent) {
+        used += tag.chars().count() + 1;
+        spans.push(Span::styled(tag, Style::default().fg(agent_color(idx))));
+        spans.push(Span::raw(" "));
+    }
+    let kind_style = if e.kind == 'W' {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled(e.kind.to_string(), kind_style));
+    spans.push(Span::raw(" "));
+    used += 2;
+    let stat = match (e.adds, e.dels) {
+        (Some(a), Some(d)) => format!(" +{a} −{d}"),
+        _ => " ⋯".to_string(),
+    };
+    let pw = w.saturating_sub(used + stat.chars().count()).max(8);
+    let path_style = if e.err {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    };
+    spans.push(Span::styled(tail_truncate(&e.path, pw), path_style));
+    match (e.adds, e.dels) {
+        (Some(a), Some(d)) => {
+            spans.push(Span::styled(format!(" +{a}"), Style::default().fg(Color::Green)));
+            spans.push(Span::styled(format!(" −{d}"), Style::default().fg(Color::Red)));
+        }
+        _ => spans.push(Span::styled(" ⋯", Style::default().fg(Color::Yellow))),
+    }
+    Line::from(spans)
+}
+
+fn render_files(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Files, rect));
+    let h = inner_h(rect);
+    let w = rect.width.saturating_sub(2) as usize;
+
+    enum Row<'a> {
+        R(&'a crate::app::ReadEntry),
+        W(&'a crate::app::WriteEntry),
+    }
+    let total = app.reads.len() + app.writes.len();
+    let (start, end) = window(app, PaneId::Files, total, h);
+    let mut rows: Vec<(i64, Row)> = Vec::new();
+    for r in &app.reads {
+        rows.push((r.ts, Row::R(r)));
+    }
+    for e in &app.writes {
+        rows.push((e.ts, Row::W(e)));
+    }
+    rows.sort_by_key(|(ts, _)| *ts);
+    let mut lines: Vec<Line> = Vec::new();
+    for (_, row) in &rows[start..end] {
+        match row {
+            Row::R(r) => {
+                let mut spans: Vec<Span> = vec![
+                    Span::styled(fmt_clock(r.ts), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                    Span::styled("R", Style::default().fg(Color::Cyan)),
+                    Span::raw(" "),
+                ];
+                let mut used = 11;
+                if let Some((tag, idx)) = app.agent_tag(&r.agent) {
+                    used += tag.chars().count() + 1;
+                    spans.push(Span::styled(tag, Style::default().fg(agent_color(idx))));
+                    spans.push(Span::raw(" "));
+                }
+                let suffix = if r.count > 1 { format!(" ×{}", r.count) } else { String::new() };
+                let pw = w.saturating_sub(used + suffix.chars().count()).max(8);
+                spans.push(Span::styled(
+                    tail_truncate(&r.path, pw),
+                    Style::default().fg(Color::Gray),
+                ));
+                if !suffix.is_empty() {
+                    spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
+                }
+                lines.push(Line::from(spans));
+            }
+            Row::W(e) => lines.push(write_line(app, e, w)),
+        }
+    }
+    let block = pane_block(app, PaneId::Files, format!("files {total}"), accent);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn event_short(event: &str) -> &str {
+    match event {
+        "PreToolUse" => "pre",
+        "PostToolUse" => "post",
+        "Stop" => "stop",
+        "SubagentStop" => "sastop",
+        "UserPromptSubmit" => "prompt",
+        "SessionStart" => "start",
+        "SessionEnd" => "end",
+        "Notification" => "notif",
+        "PreCompact" => "compact",
+        e => e,
+    }
+}
+
+fn render_hooks(
+    f: &mut Frame,
+    app: &mut App,
+    rect: Rect,
+    accent: Color,
+    pane: PaneId,
+    with_skills: bool,
+) {
+    app.pane_rects.push((pane, rect));
+    let h = inner_h(rect);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut matched: Vec<&str> = Vec::new();
+
+    for c in &app.hooks_config {
+        let stat = c
+            .status_message
+            .as_deref()
+            .and_then(|sm| app.hook_stats.get_key_value(sm))
+            .or_else(|| {
+                app.hook_stats
+                    .iter()
+                    .find(|(k, _)| c.command.starts_with(k.trim_end_matches('…')) && !k.is_empty())
+                    .map(|(k, v)| (k, v))
+            });
+        let (count, acted, avg) = match stat {
+            Some((k, st)) => {
+                matched.push(k.as_str());
+                (st.count, st.acted, if st.count > 0 { st.total_ms / st.count } else { 0 })
+            }
+            None => (0, 0, 0),
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{:<6}", event_short(&c.event)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                c.name.clone(),
+                if count > 0 { Style::default() } else { Style::default().fg(Color::DarkGray) },
+            ),
+            Span::styled(
+                format!(" ×{count}"),
+                if count > 0 {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+        ];
+        if count > 0 {
+            spans.push(Span::styled(
+                format!(" {avg}ms"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if acted > 0 {
+            spans.push(Span::styled(
+                format!(" ⚠{acted}"),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    for (cmd, st) in &app.hook_stats {
+        if matched.contains(&cmd.as_str()) {
+            continue;
+        }
+        let mut spans = vec![
+            Span::styled("·     ", Style::default().fg(Color::DarkGray)),
+            Span::raw(truncate_chars(cmd, 30)),
+            Span::styled(
+                format!(" ×{}", st.count),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if st.acted > 0 {
+            spans.push(Span::styled(
+                format!(" ⚠{}", st.acted),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if !app.hook_actions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "── acted ──",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for a in &app.hook_actions {
+            let style = match a.sev {
+                2 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                _ => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            };
+            let mut spans = vec![
+                Span::styled(fmt_clock(a.ts), Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(a.label.clone(), style),
+            ];
+            if !a.detail.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}", truncate_chars(&a.detail, 60)),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    if with_skills {
+        lines.push(Line::from(Span::styled(
+            "── skills ──",
+            Style::default().fg(Color::LightBlue),
+        )));
+        lines.extend(skill_lines(app));
+    }
+    let total = lines.len();
+    let (start, end) = window(app, pane, total, h);
+    let visible = lines[start..end].to_vec();
+    let acted_total: u64 = app.hook_stats.values().map(|s| s.acted).sum();
+    let title = if acted_total > 0 {
+        format!("hooks ⚠{acted_total}")
+    } else {
+        "hooks".to_string()
+    };
+    let title = if with_skills { format!("{title} + skills") } else { title };
+    let block = pane_block(app, pane, title, accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+fn skill_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for sk in &app.skills {
+        out.push(Line::from(vec![
+            Span::styled(fmt_clock(sk.last_ts), Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(
+                sk.name.clone(),
+                Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" ×{}", sk.count), Style::default().fg(Color::White)),
+        ]));
+    }
+    out
+}
+
+fn render_skills(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Skills, rect));
+    let h = inner_h(rect);
+    let lines = skill_lines(app);
+    let total = lines.len();
+    let (start, end) = window(app, PaneId::Skills, total, h);
+    let visible = lines[start..end].to_vec();
+    let block = pane_block(app, PaneId::Skills, format!("skills {total}"), accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+fn filter_label(app: &App) -> String {
+    match app.think_filter() {
+        ThinkFilter::All => "all".to_string(),
+        ThinkFilter::Main => "main".to_string(),
+        ThinkFilter::Agent(i) => match app.agent_by_idx(i) {
+            Some(a) => {
+                let m = if a.model.is_empty() { "?" } else { crate::price::model_short(&a.model) };
+                let desc = if a.desc.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", truncate_chars(&a.desc, 30))
+                };
+                format!("sa:{m}:{i}{desc}")
+            }
+            None => format!("sa:?:{i}"),
+        },
+    }
+}
+
+fn render_thinking(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Thinking, rect));
+    let h = inner_h(rect);
+    let width = (rect.width.saturating_sub(2) as usize).max(10);
+    let filter = app.think_filter();
+
+    let key = (width, app.think_filter_pos, app.thinking.len(), app.agent_order.len());
+    if app.think_cache_key != key {
+        app.think_cache_key = key;
+        let mut sel: Vec<(i64, Option<(String, usize)>, String)> = Vec::new();
+        for t in &app.thinking {
+            let tag = app.agent_tag(&t.agent);
+            let keep = match filter {
+                ThinkFilter::All => true,
+                ThinkFilter::Main => t.agent.is_none(),
+                ThinkFilter::Agent(i) => tag.as_ref().map(|(_, x)| *x == i).unwrap_or(false),
+            };
+            if keep {
+                sel.push((t.ts, tag, t.text.clone()));
+            }
+        }
+        app.think_lines.clear();
+        for (ts, tag, text) in sel {
+            let (label, idx) = match tag {
+                Some((t, i)) => (t, Some(i)),
+                None => ("[main]".to_string(), None),
+            };
+            app.think_lines.push(TLine {
+                text: format!("── {} {} ──", fmt_clock(ts), label),
+                agent_idx: idx,
+                header: true,
+            });
+            for wline in textwrap::wrap(&text, width) {
+                app.think_lines.push(TLine {
+                    text: wline.into_owned(),
+                    agent_idx: idx,
+                    header: false,
+                });
+            }
+        }
+    }
+
+    // search matches
+    app.search.matches.clear();
+    if let Some(q) = app.search.query.clone() {
+        let ql = q.to_lowercase();
+        for (i, l) in app.think_lines.iter().enumerate() {
+            if !l.header && l.text.to_lowercase().contains(&ql) {
+                app.search.matches.push(i);
+            }
+        }
+        if app.search.jump_pending {
+            app.search.jump_pending = false;
+            if !app.search.matches.is_empty() {
+                app.search.cur = app.search.matches.len() - 1;
+                app.pending_jump = Some(app.search.matches[app.search.cur]);
+            }
+        }
+        if app.search.cur >= app.search.matches.len() {
+            app.search.cur = app.search.matches.len().saturating_sub(1);
+        }
+    }
+
+    let total = app.think_lines.len();
+    if let Some(idx) = app.pending_jump.take() {
+        let off = total
+            .saturating_sub(idx + h / 2 + 1)
+            .min(total.saturating_sub(h));
+        app.scroll.insert(PaneId::Thinking, off);
+    }
+    let (start, end) = window(app, PaneId::Thinking, total, h);
+
+    let cur_match_line = app
+        .search
+        .matches
+        .get(app.search.cur)
+        .copied()
+        .unwrap_or(usize::MAX);
+    let query = app.search.query.clone();
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, l) in app.think_lines[start..end].iter().enumerate() {
+        let gi = start + i;
+        if l.header {
+            let color = l.agent_idx.map(agent_color).unwrap_or(Color::DarkGray);
+            lines.push(Line::from(Span::styled(
+                l.text.clone(),
+                Style::default().fg(color).add_modifier(Modifier::DIM),
+            )));
+        } else {
+            let base = Style::default().fg(Color::Gray);
+            match &query {
+                Some(q) => lines.push(highlight_line(&l.text, q, base, gi == cur_match_line)),
+                None => lines.push(Line::from(Span::styled(l.text.clone(), base))),
+            }
+        }
+    }
+
+    let mut title = format!("narrative · {}", filter_label(app));
+    if let Some(q) = &app.search.query {
+        if app.search.matches.is_empty() {
+            title.push_str(&format!(" · \"{q}\" no matches"));
+        } else {
+            title.push_str(&format!(
+                " · \"{q}\" {}/{}",
+                app.search.cur + 1,
+                app.search.matches.len()
+            ));
+        }
+    }
+    let block = pane_block(app, PaneId::Thinking, title, accent);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn highlight_line(text: &str, query: &str, base: Style, is_current: bool) -> Line<'static> {
+    let lt = text.to_lowercase();
+    let lq = query.to_lowercase();
+    // Byte-offset math is only safe when lowering didn't change lengths.
+    if lq.is_empty() || lt.len() != text.len() {
+        return Line::from(Span::styled(text.to_string(), base));
+    }
+    let hl = if is_current {
+        Style::default().fg(Color::Black).bg(Color::LightRed).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Yellow)
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    let mut pos = 0;
+    while let Some(found) = lt[pos..].find(&lq) {
+        let s = pos + found;
+        let e = s + lq.len();
+        if !text.is_char_boundary(s) || !text.is_char_boundary(e) {
+            break;
+        }
+        if s > pos {
+            spans.push(Span::styled(text[pos..s].to_string(), base));
+        }
+        spans.push(Span::styled(text[s..e].to_string(), hl));
+        pos = e;
+    }
+    if pos < text.len() {
+        spans.push(Span::styled(text[pos..].to_string(), base));
+    }
+    if spans.is_empty() {
+        return Line::from(Span::styled(text.to_string(), base));
+    }
+    Line::from(spans)
+}
+
+fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent: Color) {
+    if let Some(input) = &app.search.input {
+        let line = Line::from(vec![
+            Span::styled(
+                " search: ",
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "  enter=go · esc=cancel · n/N=next/prev",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), rect);
+        return;
+    }
+
+    let now = now_ms();
+    if app.sessions.is_empty() {
+        let line = Line::from(Span::styled(
+            " no claude sessions found for this folder — waiting… ",
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        f.render_widget(Paragraph::new(line), rect);
+        return;
+    }
+
+    let (badge, badge_style, bar_style) = match status {
+        Status::Working => (
+            format!(" ⚡ WORKING {} ", fmt_dur(now - app.turn_start_ts)),
+            Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default(),
+        ),
+        Status::Waiting => {
+            let since = if app.last_turn_end_ts > 0 {
+                format!("{} ", fmt_dur(now - app.last_turn_end_ts))
+            } else {
+                String::new()
+            };
+            (
+                format!(" ⏸ WAITING FOR INPUT {since}"),
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            )
+        }
+        Status::Blocked => {
+            let why = if app.has_pending_tools() { " — permission?" } else { "" };
+            let idle = app.last_activity.elapsed().as_millis() as i64;
+            (
+                format!(" ⚠ STALLED{why} {} ", fmt_dur(idle)),
+                Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White).bg(Color::Red),
+            )
+        }
+    };
+
+    let sref = &app.sessions[app.sel];
+    let mut label = if app.title.is_empty() {
+        truncate_chars(&sref.id, 8)
+    } else {
+        truncate_chars(&app.title, 28)
+    };
+    if let Some(wt) = &sref.worktree {
+        label.push_str(&format!(" ⎇{}", truncate_chars(wt, 16)));
+    }
+    let t = app.totals();
+    let win = app.effective_window();
+    let pct = if win > 0 {
+        ((app.ctx_tokens as f64 / win as f64) * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let filled = ((pct / 100.0) * 8.0).round() as usize;
+    let bar: String = "▓".repeat(filled.min(8)) + &"░".repeat(8 - filled.min(8));
+    let model = if app.model.is_empty() {
+        "?".to_string()
+    } else {
+        crate::price::model_short(&app.model).to_string()
+    };
+
+    let dim = if bar_style.bg.is_some() {
+        bar_style
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let norm = if bar_style.bg.is_some() { bar_style } else { Style::default() };
+
+    let spans = vec![
+        Span::styled(badge, badge_style),
+        Span::styled(
+            format!(" {label} {}/{} · {model}", app.sel + 1, app.sessions.len()),
+            norm,
+        ),
+        Span::styled(" │ ", dim),
+        Span::styled(
+            format!(
+                "in {} · out {} · cache {}",
+                fmt_tok(t.input + t.c5m + t.c1h),
+                fmt_tok(t.output),
+                fmt_tok(t.cache_read)
+            ),
+            norm,
+        ),
+        Span::styled(" │ ", dim),
+        Span::styled(
+            format!("NZ${:.2}", app.cost_usd() * app.nzd_rate),
+            norm.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", dim),
+        Span::styled(
+            format!("ctx {:.0}% ({}/{}) {bar}", pct, fmt_tok(app.ctx_tokens), fmt_tok(win)),
+            norm,
+        ),
+        Span::styled(" │ ", dim),
+        Span::styled("1-3 layout · ⇥ session · <> think · / find · q", dim),
+    ];
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn draws_all_layouts_without_panicking() {
+        // nonexistent cwd → zero sessions → empty-state rendering
+        let mut app = App::new(
+            std::path::PathBuf::from("/nonexistent/claude-watch-test"),
+            1.68,
+            200_000,
+        );
+        let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        for layout in [1u8, 2, 3] {
+            app.layout = layout;
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        let content = format!("{:?}", term.backend().buffer());
+        assert!(content.contains("activity"));
+        assert!(content.contains("no claude sessions found"));
+    }
+}
