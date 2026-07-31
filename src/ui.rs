@@ -51,10 +51,10 @@ fn layout_default(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
     let top = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(main[0]);
     render_thinking(f, app, top[0], accent);
     let rail = Layout::vertical([
-        Constraint::Percentage(26),
-        Constraint::Percentage(26),
-        Constraint::Percentage(28),
-        Constraint::Percentage(20),
+        Constraint::Percentage(30),
+        Constraint::Percentage(30),
+        Constraint::Percentage(25),
+        Constraint::Percentage(15),
     ])
     .split(top[1]);
     render_reads(f, app, rail[0], accent);
@@ -69,10 +69,10 @@ fn layout_ops(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
     let cols = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).split(area);
     render_feed(f, app, cols[0], accent);
     let rail = Layout::vertical([
-        Constraint::Percentage(26),
-        Constraint::Percentage(26),
-        Constraint::Percentage(28),
-        Constraint::Percentage(20),
+        Constraint::Percentage(30),
+        Constraint::Percentage(30),
+        Constraint::Percentage(25),
+        Constraint::Percentage(15),
     ])
     .split(cols[1]);
     render_reads(f, app, rail[0], accent);
