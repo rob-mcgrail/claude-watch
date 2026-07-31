@@ -163,6 +163,14 @@ pub enum Status {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+pub enum LastKind {
+    Prompt,
+    Reply,
+    Tool,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 pub enum FeedKind {
     Tool,
     Mcp,
@@ -380,6 +388,7 @@ pub struct App {
     pub branch: String,
 
     turn_open: bool,
+    last_main_kind: LastKind,
     pub turn_start_ts: i64,
     pub last_turn_end_ts: i64,
     last_ts: i64,
@@ -443,6 +452,7 @@ impl App {
             title: String::new(),
             branch: String::new(),
             turn_open: false,
+            last_main_kind: LastKind::Other,
             turn_start_ts: 0,
             last_turn_end_ts: 0,
             last_ts: 0,
@@ -505,6 +515,7 @@ impl App {
         self.title.clear();
         self.branch.clear();
         self.turn_open = false;
+        self.last_main_kind = LastKind::Other;
         self.turn_start_ts = 0;
         self.last_turn_end_ts = 0;
         self.last_ts = 0;
@@ -619,13 +630,42 @@ impl App {
             return Status::Waiting;
         }
         let idle = self.last_activity.elapsed();
-        if idle > Duration::from_secs(10) && !self.pending.is_empty() {
-            return Status::Blocked;
+        match self.last_main_kind {
+            // mid-tool: quiet + unresolved tool = probably a permission prompt
+            LastKind::Tool => {
+                if !self.pending.is_empty() && idle > Duration::from_secs(10) {
+                    Status::Blocked
+                } else if idle > Duration::from_secs(60) {
+                    Status::Blocked
+                } else {
+                    Status::Working
+                }
+            }
+            // a reply then silence: the turn is over even if turn_duration
+            // never arrived (it goes missing while background agents run)
+            LastKind::Reply => {
+                if idle > Duration::from_secs(20) {
+                    Status::Waiting
+                } else {
+                    Status::Working
+                }
+            }
+            // a prompt then silence: it was undone/edited away before running
+            LastKind::Prompt => {
+                if idle > Duration::from_secs(45) {
+                    Status::Waiting
+                } else {
+                    Status::Working
+                }
+            }
+            LastKind::Other => {
+                if idle > Duration::from_secs(60) {
+                    Status::Waiting
+                } else {
+                    Status::Working
+                }
+            }
         }
-        if idle > Duration::from_secs(45) {
-            return Status::Blocked;
-        }
-        Status::Working
     }
 
     pub fn has_pending_tools(&self) -> bool {
@@ -903,6 +943,7 @@ impl App {
                             });
                             if agent.is_none() {
                                 self.push_ctx(ts, CtxKind::Assistant, t.to_string());
+                                self.last_main_kind = LastKind::Reply;
                             }
                         }
                     }
@@ -912,6 +953,9 @@ impl App {
                     let name = s(block, "name").unwrap_or("");
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     self.apply_tool_use(ts, agent, &id, name, &input);
+                    if agent.is_none() {
+                        self.last_main_kind = LastKind::Tool;
+                    }
                 }
                 _ => {}
             }
@@ -1156,6 +1200,9 @@ impl App {
                     let is_err = block.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
                     let rtext = result_text(block);
                     self.resolve_tool(ts, v, tid, is_err, rtext);
+                    if !sidechain {
+                        self.last_main_kind = LastKind::Tool;
+                    }
                 }
                 "text" => {
                     if let Some(t) = s(block, "text") {
@@ -1211,6 +1258,7 @@ impl App {
         let line = format!("❯ {}", first_line(text, 130));
         self.push_feed(ts, None, line, FeedKind::Prompt, ToolStatus::None);
         self.push_ctx(ts, CtxKind::User, text.to_string());
+        self.last_main_kind = LastKind::Prompt;
         if !self.turn_open {
             self.turn_open = true;
             self.turn_start_ts = ts;
