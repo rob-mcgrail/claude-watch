@@ -83,6 +83,9 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // warm the g view in the background so it's populated on first visit
+    app.gh_refresh();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -223,7 +226,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         KeyCode::Char('g') => {
             app.layout = 7;
             app.focus = PaneId::GitHub;
-            app.gh_refresh();
+            app.gh_refresh_if_stale(30);
         }
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),

@@ -1661,6 +1661,12 @@ impl App {
 
     // ---------- view g: github + haunt ----------
 
+    pub fn gh_refresh_if_stale(&mut self, secs: i64) {
+        if self.gh.fetched_at_ms == 0 || now_ms() - self.gh.fetched_at_ms > secs * 1000 {
+            self.gh_refresh();
+        }
+    }
+
     pub fn gh_refresh(&mut self) {
         if self.gh.fetching {
             return;
