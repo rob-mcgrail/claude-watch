@@ -1,16 +1,15 @@
 use std::process::Command;
 
-use serde_json::Value;
-
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::app::{now_ms, truncate_chars};
 
 #[derive(Serialize, Deserialize)]
 pub struct HauntRun {
     pub source: String, // "roadmap" | "sites"
-    pub label: String,        // project slug / site repo name
-    pub what: String,         // run mode + stories / maintenance task
+    pub label: String,  // project slug / site repo name
+    pub what: String,   // run mode + stories / maintenance task
     pub status: String,
     pub running: bool,
     pub ok: bool,
@@ -58,6 +57,36 @@ fn parse_flex_ms(t: &str) -> i64 {
     0
 }
 
+/// One roadmap RunSummary → a card row, or None if outside the window.
+fn roadmap_run(r: &Value, label: String, now: i64, window: i64) -> Option<HauntRun> {
+    let created = parse_flex_ms(s(r, "created_at"));
+    let status = s(r, "status").to_string();
+    let unfinished = r.get("completed_at").map(|x| x.is_null()).unwrap_or(false);
+    let running = unfinished && matches!(status.as_str(), "in_progress" | "pending" | "blocked");
+    if !running && now - created > window {
+        return None;
+    }
+    let nstories = r
+        .get("story_slugs")
+        .and_then(|x| x.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let what = if nstories > 0 {
+        format!("{} · {} stories", s(r, "mode"), nstories)
+    } else {
+        s(r, "mode").to_string()
+    };
+    Some(HauntRun {
+        source: "roadmap".to_string(),
+        label,
+        what,
+        status: status.clone(),
+        running,
+        ok: status == "done",
+        created_ms: created,
+    })
+}
+
 /// Blocking fetch of roadmap + sites delivery runs — background thread only.
 pub fn fetch() -> HauntState {
     let now = now_ms();
@@ -95,64 +124,51 @@ pub fn fetch() -> HauntState {
         Err(e) => st.sites_err = Some(e),
     }
 
-    // roadmaps.haunt.digital delivery runs: check recently-updated projects
-    match cli_json("roadmap", &["projects", "--json"]) {
+    // roadmaps.haunt.digital delivery runs: one global call (/api/runs),
+    // falling back to a per-project scan on CLIs without `runs --all`
+    match cli_json("roadmap", &["runs", "--all", "--limit", "60", "--json"]) {
         Ok(v) => {
-            let mut slugs: Vec<(i64, String)> = v
-                .as_array()
-                .unwrap_or(&empty)
-                .iter()
-                .filter_map(|p| {
-                    let slug = ["slug", "name", "id"]
-                        .iter()
-                        .map(|k| s(p, k))
-                        .find(|x| !x.is_empty())?
-                        .to_string();
-                    let upd = ["updated_at", "updatedAt", "updated", "last_activity_at"]
-                        .iter()
-                        .map(|k| parse_flex_ms(s(p, k)))
-                        .max()
-                        .unwrap_or(0);
-                    Some((upd, slug))
-                })
-                .collect();
-            slugs.sort_by_key(|(u, _)| -u);
-            for (_, slug) in slugs.into_iter().take(6) {
-                let Ok(rv) = cli_json("roadmap", &["--slug", &slug, "runs", "--json"]) else {
-                    continue;
-                };
-                for r in rv.as_array().unwrap_or(&empty) {
-                    let created = parse_flex_ms(s(r, "created_at"));
-                    let status = s(r, "status").to_string();
-                    let unfinished = r.get("completed_at").map(|x| x.is_null()).unwrap_or(false);
-                    let running =
-                        unfinished && matches!(status.as_str(), "in_progress" | "pending" | "blocked");
-                    if !running && now - created > window {
-                        continue;
-                    }
-                    let nstories = r
-                        .get("story_slugs")
-                        .and_then(|x| x.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    let what = if nstories > 0 {
-                        format!("{} · {} stories", s(r, "mode"), nstories)
-                    } else {
-                        s(r, "mode").to_string()
-                    };
-                    st.runs.push(HauntRun {
-                        source: "roadmap".to_string(),
-                        label: slug.clone(),
-                        what,
-                        status: status.clone(),
-                        running,
-                        ok: status == "done",
-                        created_ms: created,
-                    });
+            for r in v.as_array().unwrap_or(&empty) {
+                let label = s(r, "project_slug").to_string();
+                if let Some(run) = roadmap_run(r, label, now, window) {
+                    st.runs.push(run);
                 }
             }
         }
-        Err(e) => st.roadmap_err = Some(e),
+        Err(global_err) => match cli_json("roadmap", &["projects", "--json"]) {
+            Ok(v) => {
+                let mut slugs: Vec<(i64, String)> = v
+                    .as_array()
+                    .unwrap_or(&empty)
+                    .iter()
+                    .filter_map(|p| {
+                        let slug = ["slug", "name", "id"]
+                            .iter()
+                            .map(|k| s(p, k))
+                            .find(|x| !x.is_empty())?
+                            .to_string();
+                        let upd = ["updated_at", "updatedAt", "updated", "last_activity_at"]
+                            .iter()
+                            .map(|k| parse_flex_ms(s(p, k)))
+                            .max()
+                            .unwrap_or(0);
+                        Some((upd, slug))
+                    })
+                    .collect();
+                slugs.sort_by_key(|(u, _)| -u);
+                for (_, slug) in slugs.into_iter().take(6) {
+                    let Ok(rv) = cli_json("roadmap", &["--slug", &slug, "runs", "--json"]) else {
+                        continue;
+                    };
+                    for r in rv.as_array().unwrap_or(&empty) {
+                        if let Some(run) = roadmap_run(r, slug.clone(), now, window) {
+                            st.runs.push(run);
+                        }
+                    }
+                }
+            }
+            Err(_) => st.roadmap_err = Some(global_err),
+        },
     }
 
     st.runs.sort_by_key(|r| (!r.running, -r.created_ms));
