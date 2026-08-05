@@ -429,6 +429,8 @@ pub struct App {
 
     // github + haunt activity (view g / space)
     pub gh_mode: GhMode,
+    /// Where space was pressed from, so pressing it again puts you back.
+    gh_prev: Option<(u8, PaneId, GhMode)>,
     gh_views: [GhView; 2],
     gh_tx: Sender<GhMsg>,
     gh_rx: Receiver<GhMsg>,
@@ -588,6 +590,7 @@ impl App {
             overview_ranges: Vec::new(),
             last_overview_scan: Instant::now(),
             gh_mode: GhMode::Live,
+            gh_prev: None,
             gh_views: Default::default(),
             gh_tx,
             gh_rx,
@@ -734,10 +737,15 @@ impl App {
             self.last_gcache_check = Instant::now();
             self.load_gcache(self.gh_mode);
         }
-        // only the mode on screen auto-refreshes; the other keeps what it has
-        // until you switch to it
-        if self.layout == 7 && self.gh_stale(self.gh_mode) {
-            self.gh_refresh(self.gh_mode);
+        // the mode on screen comes first; when it is fresh, spend the idle time
+        // keeping the other one warm so switching to it never shows a reload
+        if self.layout == 7 {
+            let active = self.gh_mode;
+            if self.gh_stale(active) {
+                self.gh_refresh(active);
+            } else if let Some(m) = GhMode::ALL.into_iter().find(|&m| m != active && self.gh_stale(m)) {
+                self.gh_refresh(m);
+            }
         }
         while let Ok(msg) = self.gh_rx.try_recv() {
             self.apply_gh(msg);
@@ -1785,6 +1793,27 @@ impl App {
         self.load_gcache(m);
         if self.gh_stale(m) {
             self.gh_refresh(m);
+        }
+    }
+
+    /// Space is a round trip, not a one-way door: it peeks at the digest and,
+    /// pressed again, drops you back in the view you came from — including the
+    /// live mode of this same pane.
+    pub fn gh_toggle_digest(&mut self) {
+        if self.layout == 7 && self.gh_mode == GhMode::Digest {
+            let (layout, focus, mode) = self.gh_prev.take().unwrap_or((1, PaneId::Thinking, GhMode::Live));
+            self.layout = layout;
+            self.focus = focus;
+            if self.gh_mode != mode {
+                self.gh_mode = mode;
+                self.scroll.insert(PaneId::GitHub, 0);
+            }
+            if layout == 7 {
+                self.load_gcache(mode);
+            }
+        } else {
+            self.gh_prev = Some((self.layout, self.focus, self.gh_mode));
+            self.gh_open(GhMode::Digest);
         }
     }
 

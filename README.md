@@ -34,7 +34,7 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 - `g` **live** — what is happening right now: GitHub workflows in flight plus runs from the last 4 hours (across your recently-pushed repos), PRs from the last 6 hours, and roadmap/sites delivery runs from the last 16 hours. Auto-refreshes every 2 minutes while on screen.
 - `Space` **10-day digest** — what has been happening lately: the newest 10 workflow runs, the newest 10 PRs (ranked open → merged → closed), and the newest 5 delivery runs each from roadmaps.haunt.digital and sites.haunt.digital, all over the last 10 days.
 
-Both modes are warmed on startup, so either is populated on first visit and the switch between them never refetches. Anything still in flight sorts to the top of its section. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
+`Space` is a round trip: press it to peek at the digest, press it again to drop back into whatever view you came from. Both modes are warmed on startup and the one you are not looking at is kept warm while the pane is open, so switching either way renders instantly from data already in hand — never a reload. Anything still in flight sorts to the top of its section. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
 
 `1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
 
@@ -72,7 +72,7 @@ Both modes are warmed on startup, so either is populated on first visit and the 
 | key | action |
 |-----|--------|
 | `0`–`6`, `g` | switch view (`0` sessions machine-wide, `g` github + haunt live) |
-| `Space` | github + haunt, 10-day digest mode |
+| `Space` | peek at the github + haunt 10-day digest; press again to go back |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
 | `↑` `↓` `Enter` | on view `0`: select a session and open it |
 | `<` / `>` | agent filter: all → main → each subagent (applies to narrative, activity, and tool i/o) |

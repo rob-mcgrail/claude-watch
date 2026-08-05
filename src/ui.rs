@@ -1417,12 +1417,13 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         }
     }
 
-    let updated = if v.gh.fetching {
-        "refreshing…".to_string()
-    } else if v.gh.fetched_at_ms > 0 {
-        format!("updated {} ago", fmt_dur(now - v.gh.fetched_at_ms))
-    } else {
-        "".to_string()
+    // a refresh keeps the timestamp visible — dropping it made a pane holding
+    // perfectly good data look like it had been reset
+    let updated = match (v.gh.fetching, v.gh.fetched_at_ms) {
+        (true, 0) => "fetching…".to_string(),
+        (true, at) => format!("updated {} ago · refreshing…", fmt_dur(now - at)),
+        (false, 0) => String::new(),
+        (false, at) => format!("updated {} ago", fmt_dur(now - at)),
     };
     let total = lines.len();
     let (start, end) = window(app, PaneId::GitHub, total, h);

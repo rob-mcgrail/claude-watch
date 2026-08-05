@@ -73,7 +73,7 @@ fn main() -> io::Result<()> {
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX]\n\
                                         [--dump] [--overview] [--version]\n\n\
                      keys: 0 sessions machine-wide · 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o\n\
-                           · 5 context · 6 memory) · g github + haunt (live) · space same, 10-day digest\n\
+                           · 5 context · 6 memory) · g github + haunt (live) · space 10-day digest (toggles back)\n\
                            tab/shift-tab sessions · </> agent filter (narrative, activity, tool i/o)\n\
                            / search focused pane · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
@@ -237,9 +237,8 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             app.refresh_overview();
         }
         KeyCode::Char('g') => app.gh_open(GhMode::Live),
-        // the digest is a second mode of the same pane, not a second pane —
-        // both are already fetched, so this switch is instant
-        KeyCode::Char(' ') => app.gh_open(GhMode::Digest),
+        // space is a toggle: into the digest, then back where you came from
+        KeyCode::Char(' ') => app.gh_toggle_digest(),
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
         KeyCode::Char('/') => {
