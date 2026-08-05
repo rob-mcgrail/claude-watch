@@ -1271,52 +1271,41 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         lines.push(Line::default());
     }
 
-    lines.push(hdr("── github · workflows running ──"));
+    lines.push(hdr("── github · workflow runs · last 4h ──"));
     if let Some(e) = &app.gh.error {
         lines.push(err_line(e));
     }
-    let running: Vec<_> = app.gh.runs.iter().filter(|r| r.status != "completed").collect();
-    if running.is_empty() && app.gh.error.is_none() {
+    if app.gh.runs.is_empty() && app.gh.error.is_none() {
         lines.push(none_line());
     }
-    for r in running {
+    for r in &app.gh.runs {
+        let running = r.status != "completed";
+        let (mark, st) = if running {
+            ("●", Style::default().fg(Color::Yellow))
+        } else {
+            match r.conclusion.as_str() {
+                "success" => ("✓", Style::default().fg(Color::Green)),
+                "failure" => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                "cancelled" => ("⊘", Style::default().fg(Color::DarkGray)),
+                _ => ("·", Style::default().fg(Color::Gray)),
+            }
+        };
+        let state = if running { r.status.as_str() } else { r.conclusion.as_str() };
+        let tail = if running {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         lines.push(Line::from(vec![
-            Span::styled("  ● ".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  {mark} "), st),
             Span::styled(r.repo.clone(), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" · {} ⎇{}", r.workflow, r.branch),
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
-                format!(" · {} · {}", r.status, fmt_dur(now - r.created_ms)),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    }
-    lines.push(Line::default());
-
-    lines.push(hdr("── github · workflow runs · last 4h ──"));
-    let done: Vec<_> = app.gh.runs.iter().filter(|r| r.status == "completed").collect();
-    if done.is_empty() {
-        lines.push(none_line());
-    }
-    for r in done {
-        let (mark, st) = match r.conclusion.as_str() {
-            "success" => ("✓", Style::default().fg(Color::Green)),
-            "failure" => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            "cancelled" => ("⊘", Style::default().fg(Color::DarkGray)),
-            _ => ("·", Style::default().fg(Color::Gray)),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {mark} "), st),
-            Span::styled(r.repo.clone(), Style::default()),
-            Span::styled(
-                format!(" · {} ⎇{}", r.workflow, r.branch),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::styled(
-                format!(" · {} · {} ago", r.conclusion, fmt_dur(now - r.created_ms)),
-                Style::default().fg(Color::DarkGray),
+                format!(" · {} · {} ago", state, fmt_dur(now - r.created_ms)),
+                tail,
             ),
         ]));
     }
