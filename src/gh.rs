@@ -67,9 +67,11 @@ pub fn fetch() -> FetchResult {
     let hour = 3_600_000i64;
     let mut error: Option<String> = None;
 
-    // candidate repos: anything of mine pushed in the last 24h
+    // candidate repos: anything I can access (incl. org repos) pushed in
+    // the last 24h — `gh repo list` only sees personally-owned repos
     let repos = match gh_json(&[
-        "repo", "list", "--limit", "50", "--json", "nameWithOwner,pushedAt",
+        "api",
+        "user/repos?sort=pushed&per_page=50&affiliation=owner,collaborator,organization_member",
     ]) {
         Ok(v) => v,
         Err(e) => {
@@ -81,9 +83,9 @@ pub fn fetch() -> FetchResult {
         .as_array()
         .unwrap_or(&empty)
         .iter()
-        .filter(|r| now - iso_ms(r, "pushedAt") < 24 * hour)
-        .filter_map(|r| r.get("nameWithOwner").and_then(|x| x.as_str()))
-        .take(8)
+        .filter(|r| now - iso_ms(r, "pushed_at") < 24 * hour)
+        .filter_map(|r| r.get("full_name").and_then(|x| x.as_str()))
+        .take(12)
         .map(str::to_string)
         .collect();
 
