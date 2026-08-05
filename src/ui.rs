@@ -1295,7 +1295,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── github · workflow runs · last hour ──"));
+    lines.push(hdr("── github · workflow runs · last 4h ──"));
     let done: Vec<_> = app.gh.runs.iter().filter(|r| r.status == "completed").collect();
     if done.is_empty() {
         lines.push(none_line());

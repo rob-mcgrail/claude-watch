@@ -99,7 +99,7 @@ pub fn fetch() -> FetchResult {
                     let status = s(r, "status");
                     let created = iso_ms(r, "createdAt");
                     let running = status == "in_progress" || status == "queued";
-                    if !running && now - created > hour {
+                    if !running && now - created > 4 * hour {
                         continue;
                     }
                     runs.push(GhRun {
