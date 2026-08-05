@@ -61,11 +61,13 @@ fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
-/// Blocking fetch — run this on a background thread only.
+/// Blocking fetch — run this on a background thread only. Per-repo calls
+/// fan out onto their own threads, so wall time ≈ the slowest single call.
 pub fn fetch() -> FetchResult {
     let now = now_ms();
     let hour = 3_600_000i64;
     let mut error: Option<String> = None;
+    let empty = vec![];
 
     // candidate repos: anything I can access (incl. org repos) pushed in
     // the last 24h — `gh repo list` only sees personally-owned repos
@@ -78,7 +80,6 @@ pub fn fetch() -> FetchResult {
             return FetchResult { runs: vec![], prs: vec![], error: Some(e) };
         }
     };
-    let empty = vec![];
     let candidates: Vec<String> = repos
         .as_array()
         .unwrap_or(&empty)
@@ -89,13 +90,40 @@ pub fn fetch() -> FetchResult {
         .map(str::to_string)
         .collect();
 
-    // workflow runs: running now, or created in the last hour
+    // one thread per repo: workflow runs + PRs together
+    type RepoResult = (String, Result<Value, String>, Result<Value, String>);
+    let handles: Vec<std::thread::JoinHandle<RepoResult>> = candidates
+        .iter()
+        .map(|repo| {
+            let repo = repo.clone();
+            std::thread::spawn(move || {
+                let runs = gh_json(&[
+                    "run", "list", "-R", &repo, "--limit", "20", "--json",
+                    "workflowName,headBranch,status,conclusion,createdAt",
+                ]);
+                let prs = gh_json(&[
+                    "pr", "list", "-R", &repo, "--state", "all", "--limit", "15", "--json",
+                    "number,title,author,state,isDraft,createdAt",
+                ]);
+                (repo, runs, prs)
+            })
+        })
+        .collect();
+
+    // the cross-repo PR search runs on this thread while the fan-out flies
+    let since = chrono::DateTime::from_timestamp_millis(now - 6 * hour)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default();
+    let search = gh_json(&[
+        "search", "prs", "--involves", "@me", "--created", &format!(">={since}"),
+        "--limit", "30", "--json", "number,title,author,repository,state,isDraft,createdAt",
+    ]);
+
     let mut runs: Vec<GhRun> = Vec::new();
-    for repo in &candidates {
-        match gh_json(&[
-            "run", "list", "-R", repo, "--limit", "20", "--json",
-            "workflowName,headBranch,status,conclusion,createdAt",
-        ]) {
+    let mut prs: Vec<GhPr> = Vec::new();
+    for h in handles {
+        let Ok((repo, runs_v, prs_v)) = h.join() else { continue };
+        match runs_v {
             Ok(v) => {
                 for r in v.as_array().unwrap_or(&empty) {
                     let status = s(r, "status");
@@ -116,20 +144,7 @@ pub fn fetch() -> FetchResult {
             }
             Err(e) => error = Some(e),
         }
-    }
-    runs.sort_by_key(|r| (r.status == "completed", -r.created_ms));
-    runs.truncate(20);
-
-    // PRs created in the last 6 hours: my repos + anything involving me
-    let mut prs: Vec<GhPr> = Vec::new();
-    let since = chrono::DateTime::from_timestamp_millis(now - 6 * hour)
-        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_default();
-    for repo in &candidates {
-        if let Ok(v) = gh_json(&[
-            "pr", "list", "-R", repo, "--state", "all", "--limit", "15", "--json",
-            "number,title,author,state,isDraft,createdAt",
-        ]) {
+        if let Ok(v) = prs_v {
             for p in v.as_array().unwrap_or(&empty) {
                 let created = iso_ms(p, "createdAt");
                 if now - created > 6 * hour {
@@ -139,10 +154,7 @@ pub fn fetch() -> FetchResult {
                     repo: repo.clone(),
                     number: p.get("number").and_then(|x| x.as_u64()).unwrap_or(0),
                     title: s(p, "title"),
-                    author: p
-                        .get("author")
-                        .map(|a| s(a, "login"))
-                        .unwrap_or_default(),
+                    author: p.get("author").map(|a| s(a, "login")).unwrap_or_default(),
                     state: s(p, "state"),
                     draft: p.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false),
                     created_ms: created,
@@ -150,10 +162,10 @@ pub fn fetch() -> FetchResult {
             }
         }
     }
-    if let Ok(v) = gh_json(&[
-        "search", "prs", "--involves", "@me", "--created", &format!(">={since}"),
-        "--limit", "30", "--json", "number,title,author,repository,state,isDraft,createdAt",
-    ]) {
+    runs.sort_by_key(|r| (r.status == "completed", -r.created_ms));
+    runs.truncate(20);
+
+    if let Ok(v) = search {
         for p in v.as_array().unwrap_or(&empty) {
             let repo = p
                 .get("repository")

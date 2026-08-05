@@ -1676,8 +1676,13 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.gh_rx = Some(rx);
         std::thread::spawn(move || {
-            let g = crate::gh::fetch();
+            let gh_handle = std::thread::spawn(crate::gh::fetch);
             let h = crate::haunt::fetch();
+            let g = gh_handle.join().unwrap_or_else(|_| crate::gh::FetchResult {
+                runs: vec![],
+                prs: vec![],
+                error: Some("gh fetch panicked".into()),
+            });
             let _ = tx.send((g, h));
         });
     }
