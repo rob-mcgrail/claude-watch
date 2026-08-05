@@ -75,7 +75,7 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 | mouse | wheel scrolls the pane under the cursor; click focuses |
 | `q` | quit |
 
-Flags: `--nzd-rate 1.72` · `--context-window 500000` · `--session <id-prefix>` · `--dump` (parse and print, no TUI)
+Flags: `--nzd-rate 1.72` · `--context-window 500000` · `--session <id-prefix>` · `--dump` (parse and print, no TUI) · `--overview` (print the machine-wide session scan) · `--version`
 
 ## How it works
 

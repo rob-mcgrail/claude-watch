@@ -63,10 +63,15 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--session" => session = args.next(),
+            "-V" | "--version" => {
+                println!("claude-watch {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "-h" | "--help" => {
                 println!(
                     "claude-watch — live dashboard for Claude Code sessions in this folder\n\n\
-                     usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX] [--dump]\n\n\
+                     usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX]\n\
+                                        [--dump] [--overview] [--version]\n\n\
                      keys: 0 sessions machine-wide · 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o\n\
                            · 5 context · 6 memory) · g github + haunt runs\n\
                            tab/shift-tab sessions · </> agent filter (narrative, activity, tool i/o)\n\

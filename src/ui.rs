@@ -1507,7 +1507,7 @@ fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent:
             norm,
         ),
         Span::styled(" │ ", dim),
-        Span::styled("0-6·g views · ⇥ session · <> agents · / find · q", dim),
+        Span::styled(concat!("0-6·g · ⇥ session · <> agents · / find · q · v", env!("CARGO_PKG_VERSION")), dim),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), rect);
 }
