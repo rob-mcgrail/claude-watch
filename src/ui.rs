@@ -1278,7 +1278,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         lines.push(Line::default());
     }
 
-    lines.push(hdr("── github · workflow runs · last 4h · newest 20 ──"));
+    lines.push(hdr("── github · workflow runs · last 10d · newest 10 ──"));
     if let Some(e) = &app.gh.error {
         lines.push(err_line(e));
     }
@@ -1318,7 +1318,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── github · prs · last 6h ──"));
+    lines.push(hdr("── github · prs · last 10d · newest 10 ──"));
     if app.gh.prs.is_empty() {
         lines.push(none_line());
     }
@@ -1351,7 +1351,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── roadmap · delivery runs · last 16h ──"));
+    lines.push(hdr("── roadmap · delivery runs · last 10d · newest 5 ──"));
     if let Some(e) = &app.haunt.roadmap_err {
         lines.push(err_line(e));
     } else {
@@ -1365,7 +1365,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── sites · maintenance runs · last 16h ──"));
+    lines.push(hdr("── sites · maintenance runs · last 10d · newest 5 ──"));
     if let Some(e) = &app.haunt.sites_err {
         lines.push(err_line(e));
     } else {

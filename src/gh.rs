@@ -65,16 +65,20 @@ fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
+/// How far back the panel looks, and how many rows each section keeps —
+/// a digest of the last 10 days rather than a live feed.
+pub const WINDOW_MS: i64 = 10 * 24 * 3_600_000;
+pub const KEEP: usize = 10;
+
 /// Blocking fetch — run this on a background thread only. Per-repo calls
 /// fan out onto their own threads, so wall time ≈ the slowest single call.
 pub fn fetch() -> FetchResult {
     let now = now_ms();
-    let hour = 3_600_000i64;
     let mut error: Option<String> = None;
     let empty = vec![];
 
-    // candidate repos: anything I can access (incl. org repos) pushed in
-    // the last 24h — `gh repo list` only sees personally-owned repos
+    // candidate repos: anything I can access (incl. org repos) pushed inside
+    // the window — `gh repo list` only sees personally-owned repos
     let repos = match gh_json(&[
         "api",
         "user/repos?sort=pushed&per_page=50&affiliation=owner,collaborator,organization_member",
@@ -88,7 +92,7 @@ pub fn fetch() -> FetchResult {
         .as_array()
         .unwrap_or(&empty)
         .iter()
-        .filter(|r| now - iso_ms(r, "pushed_at") < 24 * hour)
+        .filter(|r| now - iso_ms(r, "pushed_at") < WINDOW_MS)
         .filter_map(|r| r.get("full_name").and_then(|x| x.as_str()))
         .take(12)
         .map(str::to_string)
@@ -115,12 +119,12 @@ pub fn fetch() -> FetchResult {
         .collect();
 
     // the cross-repo PR search runs on this thread while the fan-out flies
-    let since = chrono::DateTime::from_timestamp_millis(now - 6 * hour)
+    let since = chrono::DateTime::from_timestamp_millis(now - WINDOW_MS)
         .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_default();
     let search = gh_json(&[
         "search", "prs", "--involves", "@me", "--created", &format!(">={since}"),
-        "--limit", "30", "--json", "number,title,author,repository,state,isDraft,createdAt",
+        "--limit", "60", "--json", "number,title,author,repository,state,isDraft,createdAt",
     ]);
 
     let mut runs: Vec<GhRun> = Vec::new();
@@ -133,7 +137,7 @@ pub fn fetch() -> FetchResult {
                     let status = s(r, "status");
                     let created = iso_ms(r, "createdAt");
                     let running = status == "in_progress" || status == "queued";
-                    if !running && now - created > 4 * hour {
+                    if !running && now - created > WINDOW_MS {
                         continue;
                     }
                     runs.push(GhRun {
@@ -151,7 +155,7 @@ pub fn fetch() -> FetchResult {
         if let Ok(v) = prs_v {
             for p in v.as_array().unwrap_or(&empty) {
                 let created = iso_ms(p, "createdAt");
-                if now - created > 6 * hour {
+                if now - created > WINDOW_MS {
                     continue;
                 }
                 prs.push(GhPr {
@@ -167,7 +171,7 @@ pub fn fetch() -> FetchResult {
         }
     }
     runs.sort_by_key(|r| (r.status == "completed", -r.created_ms));
-    runs.truncate(20);
+    runs.truncate(KEEP);
 
     if let Ok(v) = search {
         for p in v.as_array().unwrap_or(&empty) {
@@ -200,6 +204,7 @@ pub fn fetch() -> FetchResult {
         };
         (rank, -p.created_ms)
     });
+    prs.truncate(KEEP);
 
     FetchResult { runs, prs, error }
 }

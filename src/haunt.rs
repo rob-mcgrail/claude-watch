@@ -87,10 +87,14 @@ fn roadmap_run(r: &Value, label: String, now: i64, window: i64) -> Option<HauntR
     })
 }
 
+/// Same 10-day window as the github sections, but fewer rows each — these
+/// runs are coarser-grained, so 5 apiece is enough to read the trend.
+pub const KEEP_PER_SOURCE: usize = 5;
+
 /// Blocking fetch of roadmap + sites delivery runs — background thread only.
 pub fn fetch() -> HauntState {
     let now = now_ms();
-    let window = 16 * 3_600_000i64;
+    let window = crate::gh::WINDOW_MS;
     let mut st = HauntState::default();
     let empty = vec![];
 
@@ -172,5 +176,12 @@ pub fn fetch() -> HauntState {
     }
 
     st.runs.sort_by_key(|r| (!r.running, -r.created_ms));
+    // in-flight first, then newest — so the per-source cap keeps what matters
+    let mut kept: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    st.runs.retain(|r| {
+        let n = kept.entry(r.source.clone()).or_insert(0);
+        *n += 1;
+        *n <= KEEP_PER_SOURCE
+    });
     st
 }

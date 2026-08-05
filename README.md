@@ -29,7 +29,7 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 
 `0` **sessions** — every non-trivial session on the machine with activity in the last 30 minutes: folder, branch, title, age, model, and the last five actions. Arrow keys (or mouse) select, `Enter` jumps into that session in the main view — repointing the whole watcher, worktrees and hooks config included.
 
-`g` **github + haunt** — fetched on a background thread from your authenticated CLIs, refreshing every 2 minutes: GitHub workflows running now and runs from the last 4 hours (across your recently-pushed repos), PRs from the last 6 hours (your repos + anything involving you), and delivery runs from the last 16 hours recorded on roadmaps.haunt.digital and sites.haunt.digital. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
+`g` **github + haunt** — a digest of the last 10 days rather than a live feed, fetched on a background thread from your authenticated CLIs and refreshed every 2 minutes: the newest 10 GitHub workflow runs (across your recently-pushed repos), the newest 10 PRs (your repos + anything involving you, ranked open → merged → closed), and the newest 5 delivery runs each from roadmaps.haunt.digital and sites.haunt.digital. Anything still in flight sorts to the top of its section, so a long tail of finished work never pushes it out of view. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
 
 `1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
 
