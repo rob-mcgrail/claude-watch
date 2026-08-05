@@ -1,5 +1,8 @@
 mod app;
 mod discover;
+mod gh;
+mod haunt;
+mod overview;
 mod price;
 mod ui;
 
@@ -40,12 +43,25 @@ fn main() -> io::Result<()> {
                 }
             }
             "--dump" => dump = true,
+            "--overview" => {
+                for o in overview::scan(30 * 60 * 1000) {
+                    println!(
+                        "{} · {} ⎇{} · {} · {} actions · {}",
+                        o.id, o.cwd, o.branch, o.title, o.actions.len(), o.model
+                    );
+                    for (_, a) in &o.actions {
+                        println!("    {a}");
+                    }
+                }
+                return Ok(());
+            }
             "--session" => session = args.next(),
             "-h" | "--help" => {
                 println!(
                     "claude-watch — live dashboard for Claude Code sessions in this folder\n\n\
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX] [--dump]\n\n\
-                     keys: 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o · 5 context · 6 memory)\n\
+                     keys: 0 sessions machine-wide · 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o\n\
+                           · 5 context · 6 memory) · g github + haunt runs\n\
                            tab/shift-tab sessions · </> agent filter (narrative, activity, tool i/o)\n\
                            / search focused pane · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
@@ -149,6 +165,32 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         return false;
     }
 
+    if app.layout == 0 {
+        match k.code {
+            KeyCode::Up => {
+                app.overview_move(-1);
+                return false;
+            }
+            KeyCode::Down => {
+                app.overview_move(1);
+                return false;
+            }
+            KeyCode::PageUp => {
+                app.overview_move(-5);
+                return false;
+            }
+            KeyCode::PageDown => {
+                app.overview_move(5);
+                return false;
+            }
+            KeyCode::Enter => {
+                app.jump_to_selected();
+                return false;
+            }
+            _ => {}
+        }
+    }
+
     match k.code {
         KeyCode::Char('q') => return true,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return true,
@@ -172,6 +214,16 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             app.layout = 6;
             app.focus = PaneId::Memory;
             app.load_memory();
+        }
+        KeyCode::Char('0') => {
+            app.layout = 0;
+            app.focus = PaneId::Overview;
+            app.refresh_overview();
+        }
+        KeyCode::Char('g') => {
+            app.layout = 7;
+            app.focus = PaneId::GitHub;
+            app.gh_refresh();
         }
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
@@ -238,6 +290,39 @@ fn pane_at(app: &App, x: u16, y: u16) -> Option<PaneId> {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) {
+    if app.layout == 0 {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                app.overview_move(-1);
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                app.overview_move(1);
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, r)) = app
+                    .pane_rects
+                    .iter()
+                    .find(|(p, _)| *p == PaneId::Overview)
+                {
+                    if r.contains(Position::new(m.column, m.row)) {
+                        let line =
+                            app.overview_top + (m.row.saturating_sub(r.y + 1)) as usize;
+                        if let Some(ci) = app
+                            .overview_ranges
+                            .iter()
+                            .position(|(s, e)| line >= *s && line < *e)
+                        {
+                            app.overview_sel = ci;
+                        }
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
     match m.kind {
         MouseEventKind::ScrollUp => {
             if let Some(p) = pane_at(app, m.column, m.row) {

@@ -22,6 +22,8 @@ pub fn pane_label(p: PaneId) -> &'static str {
         PaneId::Writes => "writes",
         PaneId::Hooks => "hooks",
         PaneId::Skills => "skills",
+        PaneId::Overview => "sessions",
+        PaneId::GitHub => "github",
     }
 }
 
@@ -136,6 +138,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.pane_rects.clear();
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
     match app.layout {
+        0 => render_overview(f, app, rows[0], accent),
+        7 => render_github(f, app, rows[0], accent),
         2 => layout_ops(f, app, rows[0], accent),
         3 => render_feed(f, app, rows[0], accent),
         4 => render_toolio(f, app, rows[0], accent),
@@ -1103,6 +1107,294 @@ fn render_toolio(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
 
+
+fn action_style(t: &str) -> Style {
+    match t.chars().next().unwrap_or(' ') {
+        '❯' => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        '▷' => Style::default().fg(Color::Gray),
+        '⚑' => Style::default().fg(Color::LightCyan),
+        '◇' => Style::default().fg(Color::Magenta),
+        '◆' => Style::default().fg(Color::LightBlue),
+        'R' => Style::default().fg(Color::DarkGray),
+        'E' => Style::default().fg(Color::Blue),
+        _ => Style::default(),
+    }
+}
+
+fn render_overview(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Overview, rect));
+    let h = inner_h(rect);
+    let now = now_ms();
+    let home = crate::discover::home().to_string_lossy().to_string();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (ci, o) in app.overview.iter().enumerate() {
+        let selected = ci == app.overview_sel;
+        let start = lines.len();
+        let bar = if selected {
+            Span::styled("▌", Style::default().fg(accent))
+        } else {
+            Span::raw(" ")
+        };
+        let dot = if now - o.mtime_ms < 120_000 {
+            Span::styled("● ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("○ ", Style::default().fg(Color::DarkGray))
+        };
+        let mut folder = o.cwd.clone();
+        if let Some(rest) = folder.strip_prefix(&home) {
+            folder = format!("~{rest}");
+        }
+        let mut head: Vec<Span> = vec![
+            bar.clone(),
+            dot,
+            Span::styled(
+                truncate_chars(&folder, 44),
+                if selected {
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                },
+            ),
+        ];
+        if !o.branch.is_empty() {
+            head.push(Span::styled(
+                format!(" ⎇{}", truncate_chars(&o.branch, 24)),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if !o.title.is_empty() {
+            head.push(Span::styled(
+                format!("  {}", o.title.clone()),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        head.push(Span::styled(
+            format!(
+                "  · {} ago · {}",
+                fmt_dur(now - o.mtime_ms),
+                crate::price::model_short(&o.model)
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+        lines.push(Line::from(head));
+        for (ts, act) in &o.actions {
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    format!("  {} ", fmt_clock(*ts)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(act.clone(), action_style(act)),
+            ]));
+        }
+        lines.push(Line::from(bar.clone()));
+        ranges.push((start, lines.len()));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no non-trivial sessions active in the last 30 minutes",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let total = lines.len();
+    let (sel_s, sel_e) = ranges
+        .get(app.overview_sel)
+        .copied()
+        .unwrap_or((0, total.min(1)));
+    let mut top = app.overview_top.min(total.saturating_sub(h));
+    if sel_s < top {
+        top = sel_s;
+    }
+    if sel_e > top + h {
+        top = sel_e.saturating_sub(h);
+    }
+    app.overview_top = top;
+    app.overview_ranges = ranges;
+    let end = (top + h).min(total);
+    let visible = lines[top..end].to_vec();
+    let title = format!(
+        "sessions · active last 30m · {} found · ↑↓ select · ⏎ open",
+        app.overview.len()
+    );
+    let block = pane_block(app, PaneId::Overview, title, accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+fn haunt_run_line(r: &crate::haunt::HauntRun, now: i64) -> Line<'static> {
+    let (mark, st) = if r.running {
+        ("●", Style::default().fg(Color::Yellow))
+    } else if r.ok {
+        ("✓", Style::default().fg(Color::Green))
+    } else {
+        ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+    Line::from(vec![
+        Span::styled(format!("  {mark} "), st),
+        Span::styled(r.label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" · {}", r.what), Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!(" · {} · {} ago", r.status, fmt_dur(now - r.created_ms)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::GitHub, rect));
+    let h = inner_h(rect);
+    let now = now_ms();
+    let hdr = |t: &str| {
+        Line::from(Span::styled(
+            t.to_string(),
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let none_line = || {
+        Line::from(Span::styled(
+            "  · none".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let err_line = |e: &str| {
+        Line::from(Span::styled(
+            format!("  ⚠ {}", truncate_chars(e, 110)),
+            Style::default().fg(Color::Red),
+        ))
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.gh.fetching && app.gh.fetched_at_ms == 0 {
+        lines.push(Line::from(Span::styled(
+            "⋯ fetching github / roadmap / sites…",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::default());
+    }
+
+    lines.push(hdr("── github · workflows running ──"));
+    if let Some(e) = &app.gh.error {
+        lines.push(err_line(e));
+    }
+    let running: Vec<_> = app.gh.runs.iter().filter(|r| r.status != "completed").collect();
+    if running.is_empty() && app.gh.error.is_none() {
+        lines.push(none_line());
+    }
+    for r in running {
+        lines.push(Line::from(vec![
+            Span::styled("  ● ".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(r.repo.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" · {} ⎇{}", r.workflow, r.branch),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!(" · {} · {}", r.status, fmt_dur(now - r.created_ms)),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── github · workflow runs · last hour ──"));
+    let done: Vec<_> = app.gh.runs.iter().filter(|r| r.status == "completed").collect();
+    if done.is_empty() {
+        lines.push(none_line());
+    }
+    for r in done {
+        let (mark, st) = match r.conclusion.as_str() {
+            "success" => ("✓", Style::default().fg(Color::Green)),
+            "failure" => ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            "cancelled" => ("⊘", Style::default().fg(Color::DarkGray)),
+            _ => ("·", Style::default().fg(Color::Gray)),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {mark} "), st),
+            Span::styled(r.repo.clone(), Style::default()),
+            Span::styled(
+                format!(" · {} ⎇{}", r.workflow, r.branch),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!(" · {} · {} ago", r.conclusion, fmt_dur(now - r.created_ms)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── github · prs · last 6h ──"));
+    if app.gh.prs.is_empty() {
+        lines.push(none_line());
+    }
+    for p in &app.gh.prs {
+        let (mark, st) = if p.draft {
+            ("◌", Style::default().fg(Color::DarkGray))
+        } else {
+            match p.state.to_ascii_uppercase().as_str() {
+                "OPEN" => ("○", Style::default().fg(Color::Green)),
+                "MERGED" => ("⇄", Style::default().fg(Color::Magenta)),
+                _ => ("✗", Style::default().fg(Color::Red)),
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {mark} "), st),
+            Span::styled(
+                format!("{}#{}", p.repo, p.number),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}", truncate_chars(&p.title, 70)),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!(" · {} · {} ago", p.author, fmt_dur(now - p.created_ms)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── roadmap · delivery runs · last 6h ──"));
+    if let Some(e) = &app.haunt.roadmap_err {
+        lines.push(err_line(e));
+    } else {
+        let rs: Vec<_> = app.haunt.runs.iter().filter(|r| r.source == "roadmap").collect();
+        if rs.is_empty() {
+            lines.push(none_line());
+        }
+        for r in rs {
+            lines.push(haunt_run_line(r, now));
+        }
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── sites · maintenance runs · last 6h ──"));
+    if let Some(e) = &app.haunt.sites_err {
+        lines.push(err_line(e));
+    } else {
+        let rs: Vec<_> = app.haunt.runs.iter().filter(|r| r.source == "sites").collect();
+        if rs.is_empty() {
+            lines.push(none_line());
+        }
+        for r in rs {
+            lines.push(haunt_run_line(r, now));
+        }
+    }
+
+    let total = lines.len();
+    let (start, end) = window(app, PaneId::GitHub, total, h);
+    let visible = lines[start..end].to_vec();
+    let updated = if app.gh.fetching {
+        "refreshing…".to_string()
+    } else if app.gh.fetched_at_ms > 0 {
+        format!("updated {} ago", fmt_dur(now - app.gh.fetched_at_ms))
+    } else {
+        "".to_string()
+    };
+    let block = pane_block(app, PaneId::GitHub, format!("github + haunt · {updated}"), accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
 fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent: Color) {
     if let Some(input) = &app.search.input {
         let line = Line::from(vec![
@@ -1219,7 +1511,7 @@ fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent:
             norm,
         ),
         Span::styled(" │ ", dim),
-        Span::styled("1-6 views · ⇥ session · <> think · / find · q", dim),
+        Span::styled("0-6·g views · ⇥ session · <> agents · / find · q", dim),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), rect);
 }

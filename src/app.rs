@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
@@ -48,7 +49,7 @@ pub fn fmt_tok(n: u64) -> String {
     }
 }
 
-fn first_line(s: &str, max: usize) -> String {
+pub fn first_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("").trim();
     let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&collapsed, max)
@@ -153,6 +154,8 @@ pub enum PaneId {
     Memory,
     Context,
     ToolIO,
+    Overview,
+    GitHub,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -416,6 +419,19 @@ pub struct App {
     pub ctx_cache: PaneCache,
     pub tio_cache: PaneCache,
     pub mem_cache: PaneCache,
+
+    // machine-wide session switcher (view 0)
+    pub overview: Vec<crate::overview::OverviewSession>,
+    pub overview_sel: usize,
+    pub overview_top: usize,
+    pub overview_ranges: Vec<(usize, usize)>,
+    last_overview_scan: Instant,
+
+    // github + haunt activity (view g)
+    pub gh: crate::gh::GhState,
+    pub haunt: crate::haunt::HauntState,
+    gh_rx: Option<Receiver<(crate::gh::FetchResult, crate::haunt::HauntState)>>,
+    last_gh_refresh: Instant,
 }
 
 impl App {
@@ -476,6 +492,15 @@ impl App {
             ctx_cache: PaneCache::default(),
             tio_cache: PaneCache::default(),
             mem_cache: PaneCache::default(),
+            overview: Vec::new(),
+            overview_sel: 0,
+            overview_top: 0,
+            overview_ranges: Vec::new(),
+            last_overview_scan: Instant::now(),
+            gh: Default::default(),
+            haunt: Default::default(),
+            gh_rx: None,
+            last_gh_refresh: Instant::now(),
         };
         app.sessions = discover::discover_sessions(&app.cwd);
         if !app.sessions.is_empty() {
@@ -609,6 +634,32 @@ impl App {
         if self.layout == 6 && self.last_mem_check.elapsed() > Duration::from_secs(2) {
             self.last_mem_check = Instant::now();
             self.load_memory();
+        }
+        if self.layout == 0 && self.last_overview_scan.elapsed() > Duration::from_secs(5) {
+            self.last_overview_scan = Instant::now();
+            self.refresh_overview();
+        }
+        if self.layout == 7
+            && self.gh_rx.is_none()
+            && (self.gh.fetched_at_ms == 0
+                || self.last_gh_refresh.elapsed() > Duration::from_secs(120))
+        {
+            self.gh_refresh();
+        }
+        let mut fetched = false;
+        if let Some(rx) = &self.gh_rx {
+            if let Ok((g, h)) = rx.try_recv() {
+                self.gh.runs = g.runs;
+                self.gh.prs = g.prs;
+                self.gh.error = g.error;
+                self.gh.fetched_at_ms = now_ms();
+                self.gh.fetching = false;
+                self.haunt = h;
+                fetched = true;
+            }
+        }
+        if fetched {
+            self.gh_rx = None;
         }
         self.drain_tails();
     }
@@ -1570,6 +1621,59 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    // ---------- view 0: machine-wide sessions ----------
+
+    pub fn refresh_overview(&mut self) {
+        self.overview = crate::overview::scan(30 * 60 * 1000);
+        if self.overview_sel >= self.overview.len() {
+            self.overview_sel = self.overview.len().saturating_sub(1);
+        }
+    }
+
+    pub fn overview_move(&mut self, d: i64) {
+        let n = self.overview.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.overview_sel as i64;
+        self.overview_sel = (cur + d).clamp(0, n as i64 - 1) as usize;
+    }
+
+    /// Re-point the whole watcher at the selected session's folder and open it.
+    pub fn jump_to_selected(&mut self) {
+        let Some(o) = self.overview.get(self.overview_sel) else { return };
+        if o.cwd.is_empty() {
+            return;
+        }
+        let id = o.id.clone();
+        self.cwd = PathBuf::from(&o.cwd);
+        self.hooks_config = load_hook_config(&self.cwd);
+        self.sessions = discover::discover_sessions(&self.cwd);
+        if let Some(i) = self.sessions.iter().position(|x| x.id == id) {
+            self.open_session(i);
+            self.auto_follow = false;
+            self.layout = 1;
+            self.focus = PaneId::Feed;
+        }
+    }
+
+    // ---------- view g: github + haunt ----------
+
+    pub fn gh_refresh(&mut self) {
+        if self.gh.fetching {
+            return;
+        }
+        self.gh.fetching = true;
+        self.last_gh_refresh = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gh_rx = Some(rx);
+        std::thread::spawn(move || {
+            let g = crate::gh::fetch();
+            let h = crate::haunt::fetch();
+            let _ = tx.send((g, h));
+        });
     }
 
     // ---------- debug ----------

@@ -23,9 +23,15 @@ claude-watch
 
 The whole frame changes color with session state: **green** working, **amber** waiting for your input, **red** stalled (usually a permission prompt).
 
-## The six views
+## The views
 
-Number keys switch views. `1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
+Number keys switch views — plus `0` for the machine-wide session switcher and `g` for external activity.
+
+`0` **sessions** — every non-trivial session on the machine with activity in the last 30 minutes: folder, branch, title, age, model, and the last five actions. Arrow keys (or mouse) select, `Enter` jumps into that session in the main view — repointing the whole watcher, worktrees and hooks config included.
+
+`g` **github + haunt** — fetched on a background thread from your authenticated CLIs, refreshing every 2 minutes: GitHub workflows running now and runs from the last hour (across your recently-pushed repos), PRs from the last 6 hours (your repos + anything involving you), and delivery runs from the last 6 hours recorded on roadmaps.haunt.digital and sites.haunt.digital. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
+
+`1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
 
 `2` **ops** — activity + rail, no narrative:
 
@@ -60,8 +66,9 @@ Number keys switch views. `1` **main** (above) — narrative pane, reads/writes/
 
 | key | action |
 |-----|--------|
-| `1`–`6` | switch view |
+| `0`–`6`, `g` | switch view (`0` sessions machine-wide, `g` github + haunt) |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
+| `↑` `↓` `Enter` | on view `0`: select a session and open it |
 | `<` / `>` | agent filter: all → main → each subagent (applies to narrative, activity, and tool i/o) |
 | `/` then `n` / `N` | search the focused pane (activity, narrative, memory, context, tool i/o), jump between matches |
 | arrows / PgUp / PgDn / End | scroll focused pane |
