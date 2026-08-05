@@ -7,8 +7,17 @@ use serde_json::Value;
 use crate::app::{first_line, now_ms, truncate_chars};
 use crate::discover;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum SessState {
+    Working,
+    Waiting,
+    Stalled,
+    Idle,
+}
+
 /// One machine-wide session card for the `0` view.
 pub struct OverviewSession {
+    pub state: SessState,
     pub id: String,
     pub cwd: String,
     pub branch: String,
@@ -123,8 +132,79 @@ fn read_tail(p: &Path, mtime_ms: i64) -> Option<OverviewSession> {
     let mut last_prompt = String::new();
     let mut actions: Vec<(i64, String)> = Vec::new();
 
+    // main-chain state tracking, mirroring App::status()
+    #[derive(PartialEq)]
+    enum K {
+        Other,
+        Prompt,
+        Reply,
+        Tool,
+        TurnEnd,
+    }
+    let mut last_kind = K::Other;
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for line in lines {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let sidechain = v.get("isSidechain").and_then(|x| x.as_bool()).unwrap_or(false)
+            || v.get("agentId").is_some();
+        if !sidechain {
+            match s(&v, "type").unwrap_or("") {
+                "system" => {
+                    if s(&v, "subtype") == Some("turn_duration") {
+                        last_kind = K::TurnEnd;
+                    }
+                }
+                "assistant" => {
+                    if let Some(bs) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                        for b in bs {
+                            match s(b, "type").unwrap_or("") {
+                                "text" => {
+                                    if s(b, "text").map(|t| !t.trim().is_empty()).unwrap_or(false) {
+                                        last_kind = K::Reply;
+                                    }
+                                }
+                                "tool_use" => {
+                                    if let Some(id) = s(b, "id") {
+                                        pending.insert(id.to_string());
+                                    }
+                                    last_kind = K::Tool;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                "user" => {
+                    let c = v.get("message").and_then(|m| m.get("content"));
+                    let mut had_result = false;
+                    if let Some(arr) = c.and_then(|x| x.as_array()) {
+                        for b in arr {
+                            if s(b, "type") == Some("tool_result") {
+                                had_result = true;
+                                if let Some(id) = s(b, "tool_use_id") {
+                                    pending.remove(id);
+                                }
+                            }
+                        }
+                    }
+                    if had_result {
+                        last_kind = K::Tool;
+                    } else if v.get("isMeta").and_then(|x| x.as_bool()) != Some(true)
+                        && v.get("isCompactSummary").and_then(|x| x.as_bool()) != Some(true)
+                    {
+                        let txt = match c {
+                            Some(Value::String(t)) => t.clone(),
+                            _ => String::new(),
+                        };
+                        if !txt.trim().is_empty() && !txt.trim_start().starts_with('<') {
+                            last_kind = K::Prompt;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(c) = s(&v, "cwd") {
             cwd = c.to_string();
         }
@@ -157,7 +237,23 @@ fn read_tail(p: &Path, mtime_ms: i64) -> Option<OverviewSession> {
     if title.is_empty() {
         title = last_prompt.trim_start_matches("❯ ").to_string();
     }
+    // colour by what the session is DOING, not by how recently its file moved
+    let age = now_ms() - mtime_ms;
+    let state = if last_kind == K::Tool && !pending.is_empty() && age > 10_000 {
+        SessState::Stalled
+    } else if age > 600_000 {
+        SessState::Idle
+    } else if last_kind == K::TurnEnd
+        || (last_kind == K::Reply && age > 20_000)
+        || (last_kind == K::Prompt && age > 45_000)
+        || age > 60_000
+    {
+        SessState::Waiting
+    } else {
+        SessState::Working
+    };
     Some(OverviewSession {
+        state,
         id: p.file_stem()?.to_string_lossy().to_string(),
         cwd,
         branch,

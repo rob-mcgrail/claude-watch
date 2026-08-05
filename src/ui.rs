@@ -1136,14 +1136,16 @@ fn render_overview(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         } else {
             Span::raw(" ")
         };
-        let age = now - o.mtime_ms;
-        let dot = if age < 120_000 {
-            Span::styled("● ", Style::default().fg(Color::Green))
-        } else if age < 600_000 {
-            Span::styled("● ", Style::default().fg(Color::Yellow))
-        } else {
-            Span::styled("○ ", Style::default().fg(Color::DarkGray))
+        let (glyph, scolor, sname) = match o.state {
+            crate::overview::SessState::Working => ("●", Color::Green, "working"),
+            crate::overview::SessState::Waiting => ("⏸", Color::Yellow, "waiting"),
+            crate::overview::SessState::Stalled => ("⚠", Color::Red, "stalled"),
+            crate::overview::SessState::Idle => ("○", Color::DarkGray, "idle"),
         };
+        let dot = Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(scolor).add_modifier(Modifier::BOLD),
+        );
         let mut folder = o.cwd.clone();
         if let Some(rest) = folder.strip_prefix(&home) {
             folder = format!("~{rest}");
@@ -1162,7 +1164,7 @@ fn render_overview(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         ];
         if !o.branch.is_empty() {
             head.push(Span::styled(
-                format!(" ⎇{}", truncate_chars(&o.branch, 24)),
+                format!(" ⎇ {}", truncate_chars(&o.branch, 24)),
                 Style::default().fg(Color::Cyan),
             ));
         }
@@ -1172,9 +1174,11 @@ fn render_overview(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
                 Style::default().fg(Color::Gray),
             ));
         }
+        head.push(Span::styled("  · ", Style::default().fg(Color::DarkGray)));
+        head.push(Span::styled(sname, Style::default().fg(scolor)));
         head.push(Span::styled(
             format!(
-                "  · {} ago · {}",
+                " {} · {}",
                 fmt_dur(now - o.mtime_ms),
                 crate::price::model_short(&o.model)
             ),
@@ -1303,7 +1307,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
             Span::styled(format!("  {mark} "), st),
             Span::styled(r.repo.clone(), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!(" · {} ⎇{}", r.workflow, r.branch),
+                format!(" · {} ⎇ {}", r.workflow, r.branch),
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
@@ -1452,7 +1456,7 @@ fn status_bar(f: &mut Frame, app: &mut App, rect: Rect, status: Status, _accent:
         truncate_chars(&app.title, 28)
     };
     if let Some(wt) = &sref.worktree {
-        label.push_str(&format!(" ⎇{}", truncate_chars(wt, 16)));
+        label.push_str(&format!(" ⎇ {}", truncate_chars(wt, 16)));
     }
     let t = app.totals();
     let win = app.effective_window();

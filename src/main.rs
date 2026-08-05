@@ -46,9 +46,15 @@ fn main() -> io::Result<()> {
             "--dump" => dump = true,
             "--overview" => {
                 for o in overview::scan(30 * 60 * 1000) {
+                    let st = match o.state {
+                        overview::SessState::Working => "WORKING",
+                        overview::SessState::Waiting => "WAITING",
+                        overview::SessState::Stalled => "STALLED",
+                        overview::SessState::Idle => "idle",
+                    };
                     println!(
-                        "{} · {} ⎇{} · {} · {} actions · {}",
-                        o.id, o.cwd, o.branch, o.title, o.actions.len(), o.model
+                        "[{:<7}] {} ⎇ {} · {} · {}",
+                        st, o.cwd, o.branch, o.title, o.model
                     );
                     for (_, a) in &o.actions {
                         println!("    {a}");
