@@ -1632,10 +1632,28 @@ impl App {
     // ---------- view 0: machine-wide sessions ----------
 
     pub fn refresh_overview(&mut self) {
-        self.overview = crate::overview::scan(30 * 60 * 1000);
-        if self.overview_sel >= self.overview.len() {
-            self.overview_sel = self.overview.len().saturating_sub(1);
+        let selected_id = self.overview.get(self.overview_sel).map(|o| o.id.clone());
+        let mut fresh: Vec<Option<crate::overview::OverviewSession>> =
+            crate::overview::scan(30 * 60 * 1000).into_iter().map(Some).collect();
+        // stable order: existing sessions keep their positions (updated in
+        // place), vanished ones drop out, new ones append at the bottom —
+        // state changes show via color, not reordering
+        let mut list: Vec<crate::overview::OverviewSession> = Vec::new();
+        for old in &self.overview {
+            if let Some(slot) = fresh
+                .iter_mut()
+                .find(|f| f.as_ref().map(|x| x.id == old.id).unwrap_or(false))
+            {
+                list.push(slot.take().unwrap());
+            }
         }
+        for f in fresh.into_iter().flatten() {
+            list.push(f);
+        }
+        self.overview = list;
+        self.overview_sel = selected_id
+            .and_then(|id| self.overview.iter().position(|o| o.id == id))
+            .unwrap_or_else(|| self.overview_sel.min(self.overview.len().saturating_sub(1)));
     }
 
     pub fn overview_move(&mut self, d: i64) {

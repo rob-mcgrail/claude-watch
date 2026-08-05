@@ -1136,8 +1136,11 @@ fn render_overview(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         } else {
             Span::raw(" ")
         };
-        let dot = if now - o.mtime_ms < 120_000 {
+        let age = now - o.mtime_ms;
+        let dot = if age < 120_000 {
             Span::styled("● ", Style::default().fg(Color::Green))
+        } else if age < 600_000 {
+            Span::styled("● ", Style::default().fg(Color::Yellow))
         } else {
             Span::styled("○ ", Style::default().fg(Color::DarkGray))
         };
