@@ -1271,7 +1271,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         lines.push(Line::default());
     }
 
-    lines.push(hdr("── github · workflow runs · last 4h ──"));
+    lines.push(hdr("── github · workflow runs · last 4h · newest 20 ──"));
     if let Some(e) = &app.gh.error {
         lines.push(err_line(e));
     }

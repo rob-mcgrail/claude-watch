@@ -116,6 +116,7 @@ pub fn fetch() -> FetchResult {
         }
     }
     runs.sort_by_key(|r| (r.status == "completed", -r.created_ms));
+    runs.truncate(20);
 
     // PRs created in the last 6 hours: my repos + anything involving me
     let mut prs: Vec<GhPr> = Vec::new();
