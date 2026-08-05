@@ -90,7 +90,7 @@ fn roadmap_run(r: &Value, label: String, now: i64, window: i64) -> Option<HauntR
 /// Blocking fetch of roadmap + sites delivery runs — background thread only.
 pub fn fetch() -> HauntState {
     let now = now_ms();
-    let window = 12 * 3_600_000i64;
+    let window = 16 * 3_600_000i64;
     let mut st = HauntState::default();
     let empty = vec![];
 

@@ -1351,7 +1351,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── roadmap · delivery runs · last 12h ──"));
+    lines.push(hdr("── roadmap · delivery runs · last 16h ──"));
     if let Some(e) = &app.haunt.roadmap_err {
         lines.push(err_line(e));
     } else {
@@ -1365,7 +1365,7 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── sites · maintenance runs · last 12h ──"));
+    lines.push(hdr("── sites · maintenance runs · last 16h ──"));
     if let Some(e) = &app.haunt.sites_err {
         lines.push(err_line(e));
     } else {
