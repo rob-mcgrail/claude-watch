@@ -8,10 +8,16 @@ use crate::gh::{FetchResult, GhPr, GhRun};
 use crate::haunt::{HauntRun, HauntState};
 
 /// Shared on-disk cache of the g view's fetched data, so multiple
-/// claude-watch instances don't all hit gh/roadmap/sites at once.
+/// claude-watch instances don't all hit gh/roadmap/sites at once. One file per
+/// mode: the live feed and the 10-day digest hold different data and must never
+/// overwrite each other.
 
 #[derive(Deserialize)]
 pub struct GCache {
+    /// Which mode wrote this. Absent in files written before modes existed, and
+    /// those hold windows we can no longer identify — so `load` rejects them.
+    #[serde(default)]
+    pub mode: String,
     pub fetched_at_ms: i64,
     pub runs: Vec<GhRun>,
     pub prs: Vec<GhPr>,
@@ -23,6 +29,7 @@ pub struct GCache {
 
 #[derive(Serialize)]
 struct GCacheRef<'a> {
+    mode: &'a str,
     fetched_at_ms: i64,
     runs: &'a [GhRun],
     prs: &'a [GhPr],
@@ -36,23 +43,27 @@ fn dir() -> PathBuf {
     crate::discover::home().join(".cache").join("claude-watch")
 }
 
-fn file() -> PathBuf {
-    dir().join("gview.json")
+fn file(mode: &str) -> PathBuf {
+    dir().join(format!("gview-{mode}.json"))
 }
 
-fn lock() -> PathBuf {
-    dir().join("gview.lock")
+fn lock(mode: &str) -> PathBuf {
+    dir().join(format!("gview-{mode}.lock"))
 }
 
-pub fn load() -> Option<GCache> {
-    let txt = fs::read_to_string(file()).ok()?;
-    serde_json::from_str(&txt).ok()
+/// A cache written by a different mode is worse than no cache — it would render
+/// one mode's windows under the other's headers — so mismatches are dropped.
+pub fn load(mode: &str) -> Option<GCache> {
+    let txt = fs::read_to_string(file(mode)).ok()?;
+    let c: GCache = serde_json::from_str(&txt).ok()?;
+    (c.mode == mode).then_some(c)
 }
 
 /// Atomic write (temp + rename) so readers never see a torn file.
-pub fn store(g: &FetchResult, h: &HauntState) {
+pub fn store(mode: &str, g: &FetchResult, h: &HauntState) {
     let _ = fs::create_dir_all(dir());
     let c = GCacheRef {
+        mode,
         fetched_at_ms: now_ms(),
         runs: &g.runs,
         prs: &g.prs,
@@ -62,18 +73,18 @@ pub fn store(g: &FetchResult, h: &HauntState) {
         sites_err: &h.sites_err,
     };
     if let Ok(json) = serde_json::to_string(&c) {
-        let tmp = dir().join("gview.json.tmp");
+        let tmp = dir().join(format!("gview-{mode}.json.tmp"));
         if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(&tmp, file());
+            let _ = fs::rename(&tmp, file(mode));
         }
     }
 }
 
 /// One fetcher at a time across all instances; stale locks (crashed
 /// writers) are stolen after 3 minutes.
-pub fn try_lock() -> bool {
+pub fn try_lock(mode: &str) -> bool {
     let _ = fs::create_dir_all(dir());
-    let l = lock();
+    let l = lock(mode);
     if let Ok(md) = fs::metadata(&l) {
         let age = md
             .modified()
@@ -92,6 +103,6 @@ pub fn try_lock() -> bool {
         .is_ok()
 }
 
-pub fn unlock() {
-    let _ = fs::remove_file(lock());
+pub fn unlock(mode: &str) {
+    let _ = fs::remove_file(lock(mode));
 }

@@ -29,7 +29,12 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 
 `0` **sessions** — every non-trivial session on the machine with activity in the last 30 minutes: folder, branch, title, age, model, and the last five actions. Arrow keys (or mouse) select, `Enter` jumps into that session in the main view — repointing the whole watcher, worktrees and hooks config included.
 
-`g` **github + haunt** — a digest of the last 10 days rather than a live feed, fetched on a background thread from your authenticated CLIs and refreshed every 2 minutes: the newest 10 GitHub workflow runs (across your recently-pushed repos), the newest 10 PRs (your repos + anything involving you, ranked open → merged → closed), and the newest 5 delivery runs each from roadmaps.haunt.digital and sites.haunt.digital. Anything still in flight sorts to the top of its section, so a long tail of finished work never pushes it out of view. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
+`g` **github + haunt** — external activity, fetched on a background thread from your authenticated CLIs. Two modes over the same sources, each with its own cache so switching is instant:
+
+- `g` **live** — what is happening right now: GitHub workflows in flight plus runs from the last 4 hours (across your recently-pushed repos), PRs from the last 6 hours, and roadmap/sites delivery runs from the last 16 hours. Auto-refreshes every 2 minutes while on screen.
+- `Space` **10-day digest** — what has been happening lately: the newest 10 workflow runs, the newest 10 PRs (ranked open → merged → closed), and the newest 5 delivery runs each from roadmaps.haunt.digital and sites.haunt.digital, all over the last 10 days.
+
+Both modes are warmed on startup, so either is populated on first visit and the switch between them never refetches. Anything still in flight sorts to the top of its section. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
 
 `1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
 
@@ -66,7 +71,8 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 
 | key | action |
 |-----|--------|
-| `0`–`6`, `g` | switch view (`0` sessions machine-wide, `g` github + haunt) |
+| `0`–`6`, `g` | switch view (`0` sessions machine-wide, `g` github + haunt live) |
+| `Space` | github + haunt, 10-day digest mode |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
 | `↑` `↓` `Enter` | on view `0`: select a session and open it |
 | `<` / `>` | agent filter: all → main → each subagent (applies to narrative, activity, and tool i/o) |

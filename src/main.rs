@@ -22,7 +22,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Position;
 use ratatui::Terminal;
 
-use app::{App, PaneId};
+use app::{App, GhMode, PaneId};
 
 fn main() -> io::Result<()> {
     let mut nzd_rate = 1.68f64;
@@ -73,7 +73,7 @@ fn main() -> io::Result<()> {
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX]\n\
                                         [--dump] [--overview] [--version]\n\n\
                      keys: 0 sessions machine-wide · 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o\n\
-                           · 5 context · 6 memory) · g github + haunt runs\n\
+                           · 5 context · 6 memory) · g github + haunt (live) · space same, 10-day digest\n\
                            tab/shift-tab sessions · </> agent filter (narrative, activity, tool i/o)\n\
                            / search focused pane · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
@@ -95,8 +95,9 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // warm the g view in the background so it's populated on first visit
-    app.gh_refresh();
+    // warm both g-view modes in the background so either is populated on
+    // first visit and switching between them costs nothing
+    app.gh_boot();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -235,11 +236,10 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             app.focus = PaneId::Overview;
             app.refresh_overview();
         }
-        KeyCode::Char('g') => {
-            app.layout = 7;
-            app.focus = PaneId::GitHub;
-            app.gh_refresh_if_stale(30);
-        }
+        KeyCode::Char('g') => app.gh_open(GhMode::Live),
+        // the digest is a second mode of the same pane, not a second pane —
+        // both are already fetched, so this switch is instant
+        KeyCode::Char(' ') => app.gh_open(GhMode::Digest),
         KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
         KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
         KeyCode::Char('/') => {

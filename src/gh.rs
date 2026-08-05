@@ -65,14 +65,42 @@ fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
-/// How far back the panel looks, and how many rows each section keeps —
-/// a digest of the last 10 days rather than a live feed.
-pub const WINDOW_MS: i64 = 10 * 24 * 3_600_000;
-pub const KEEP: usize = 10;
+const HOUR: i64 = 3_600_000;
+
+/// How far back each section looks and how many rows it keeps. The two g-view
+/// modes are the same fetch with different numbers.
+#[derive(Copy, Clone)]
+pub struct Params {
+    pub repo_window_ms: i64,
+    pub run_window_ms: i64,
+    pub pr_window_ms: i64,
+    pub keep_runs: usize,
+    pub keep_prs: usize,
+}
+
+impl Params {
+    /// live: what is happening right now. Short windows do the trimming, so
+    /// only the run list — which a busy repo can flood — needs a cap.
+    pub const LIVE: Self = Self {
+        repo_window_ms: 24 * HOUR,
+        run_window_ms: 4 * HOUR,
+        pr_window_ms: 6 * HOUR,
+        keep_runs: 20,
+        keep_prs: usize::MAX,
+    };
+    /// digest: what has been happening lately. Here the counts do the trimming.
+    pub const DIGEST: Self = Self {
+        repo_window_ms: 10 * 24 * HOUR,
+        run_window_ms: 10 * 24 * HOUR,
+        pr_window_ms: 10 * 24 * HOUR,
+        keep_runs: 10,
+        keep_prs: 10,
+    };
+}
 
 /// Blocking fetch — run this on a background thread only. Per-repo calls
 /// fan out onto their own threads, so wall time ≈ the slowest single call.
-pub fn fetch() -> FetchResult {
+pub fn fetch(cfg: Params) -> FetchResult {
     let now = now_ms();
     let mut error: Option<String> = None;
     let empty = vec![];
@@ -92,7 +120,7 @@ pub fn fetch() -> FetchResult {
         .as_array()
         .unwrap_or(&empty)
         .iter()
-        .filter(|r| now - iso_ms(r, "pushed_at") < WINDOW_MS)
+        .filter(|r| now - iso_ms(r, "pushed_at") < cfg.repo_window_ms)
         .filter_map(|r| r.get("full_name").and_then(|x| x.as_str()))
         .take(12)
         .map(str::to_string)
@@ -119,7 +147,7 @@ pub fn fetch() -> FetchResult {
         .collect();
 
     // the cross-repo PR search runs on this thread while the fan-out flies
-    let since = chrono::DateTime::from_timestamp_millis(now - WINDOW_MS)
+    let since = chrono::DateTime::from_timestamp_millis(now - cfg.pr_window_ms)
         .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_default();
     let search = gh_json(&[
@@ -137,7 +165,7 @@ pub fn fetch() -> FetchResult {
                     let status = s(r, "status");
                     let created = iso_ms(r, "createdAt");
                     let running = status == "in_progress" || status == "queued";
-                    if !running && now - created > WINDOW_MS {
+                    if !running && now - created > cfg.run_window_ms {
                         continue;
                     }
                     runs.push(GhRun {
@@ -155,7 +183,7 @@ pub fn fetch() -> FetchResult {
         if let Ok(v) = prs_v {
             for p in v.as_array().unwrap_or(&empty) {
                 let created = iso_ms(p, "createdAt");
-                if now - created > WINDOW_MS {
+                if now - created > cfg.pr_window_ms {
                     continue;
                 }
                 prs.push(GhPr {
@@ -171,7 +199,7 @@ pub fn fetch() -> FetchResult {
         }
     }
     runs.sort_by_key(|r| (r.status == "completed", -r.created_ms));
-    runs.truncate(KEEP);
+    runs.truncate(cfg.keep_runs);
 
     if let Ok(v) = search {
         for p in v.as_array().unwrap_or(&empty) {
@@ -204,7 +232,9 @@ pub fn fetch() -> FetchResult {
         };
         (rank, -p.created_ms)
     });
-    prs.truncate(KEEP);
+    if cfg.keep_prs != usize::MAX {
+        prs.truncate(cfg.keep_prs);
+    }
 
     FetchResult { runs, prs, error }
 }

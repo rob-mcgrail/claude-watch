@@ -87,14 +87,23 @@ fn roadmap_run(r: &Value, label: String, now: i64, window: i64) -> Option<HauntR
     })
 }
 
-/// Same 10-day window as the github sections, but fewer rows each — these
-/// runs are coarser-grained, so 5 apiece is enough to read the trend.
-pub const KEEP_PER_SOURCE: usize = 5;
+/// How far back to look, and how many rows to keep per source. These runs are
+/// coarser-grained than github's, so the digest keeps fewer of them.
+#[derive(Copy, Clone)]
+pub struct Params {
+    pub window_ms: i64,
+    pub keep_per_source: usize,
+}
+
+impl Params {
+    pub const LIVE: Self = Self { window_ms: 16 * 3_600_000, keep_per_source: usize::MAX };
+    pub const DIGEST: Self = Self { window_ms: 10 * 24 * 3_600_000, keep_per_source: 5 };
+}
 
 /// Blocking fetch of roadmap + sites delivery runs — background thread only.
-pub fn fetch() -> HauntState {
+pub fn fetch(cfg: Params) -> HauntState {
     let now = now_ms();
-    let window = crate::gh::WINDOW_MS;
+    let window = cfg.window_ms;
     let mut st = HauntState::default();
     let empty = vec![];
 
@@ -181,7 +190,7 @@ pub fn fetch() -> HauntState {
     st.runs.retain(|r| {
         let n = kept.entry(r.source.clone()).or_insert(0);
         *n += 1;
-        *n <= KEEP_PER_SOURCE
+        *n <= cfg.keep_per_source
     });
     st
 }

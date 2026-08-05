@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::app::{
     fmt_clock, fmt_dur, fmt_tok, now_ms, tail_truncate, truncate_chars, App, CtxKind, FeedItem,
-    FeedKind, PaneId, SearchState, Status, TLine, ThinkFilter, ToolStatus,
+    FeedKind, GhMode, PaneId, SearchState, Status, TLine, ThinkFilter, ToolStatus,
 };
 
 pub fn pane_label(p: PaneId) -> &'static str {
@@ -1247,10 +1247,32 @@ fn haunt_run_line(r: &crate::haunt::HauntRun, now: i64) -> Line<'static> {
     ])
 }
 
+/// "4h" / "16h" / "10d" — how a window reads in a section header.
+fn win_label(ms: i64) -> String {
+    let hours = ms / 3_600_000;
+    if hours >= 24 && hours % 24 == 0 {
+        format!("{}d", hours / 24)
+    } else {
+        format!("{hours}h")
+    }
+}
+
+/// "· newest 10", or nothing when the section is uncapped.
+fn keep_label(keep: usize) -> String {
+    if keep == usize::MAX {
+        String::new()
+    } else {
+        format!(" · newest {keep}")
+    }
+}
+
 fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::GitHub, rect));
     let h = inner_h(rect);
     let now = now_ms();
+    let mode = app.gh_mode;
+    let gp = mode.gh_params();
+    let hp = mode.haunt_params();
     let hdr = |t: &str| {
         Line::from(Span::styled(
             t.to_string(),
@@ -1270,7 +1292,8 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         ))
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if app.gh.fetching && app.gh.fetched_at_ms == 0 {
+    let v = app.ghv();
+    if v.gh.fetching && v.gh.fetched_at_ms == 0 {
         lines.push(Line::from(Span::styled(
             "⋯ fetching github / roadmap / sites…",
             Style::default().fg(Color::Yellow),
@@ -1278,14 +1301,18 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         lines.push(Line::default());
     }
 
-    lines.push(hdr("── github · workflow runs · last 10d · newest 10 ──"));
-    if let Some(e) = &app.gh.error {
+    lines.push(hdr(&format!(
+        "── github · workflow runs · last {}{} ──",
+        win_label(gp.run_window_ms),
+        keep_label(gp.keep_runs)
+    )));
+    if let Some(e) = &v.gh.error {
         lines.push(err_line(e));
     }
-    if app.gh.runs.is_empty() && app.gh.error.is_none() {
+    if v.gh.runs.is_empty() && v.gh.error.is_none() {
         lines.push(none_line());
     }
-    for r in &app.gh.runs {
+    for r in &v.gh.runs {
         let running = r.status != "completed";
         let (mark, st) = if running {
             ("●", Style::default().fg(Color::Yellow))
@@ -1318,11 +1345,15 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── github · prs · last 10d · newest 10 ──"));
-    if app.gh.prs.is_empty() {
+    lines.push(hdr(&format!(
+        "── github · prs · last {}{} ──",
+        win_label(gp.pr_window_ms),
+        keep_label(gp.keep_prs)
+    )));
+    if v.gh.prs.is_empty() {
         lines.push(none_line());
     }
-    for p in &app.gh.prs {
+    for p in &v.gh.prs {
         let (mark, st) = if p.draft {
             ("◌", Style::default().fg(Color::DarkGray))
         } else {
@@ -1351,11 +1382,15 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── roadmap · delivery runs · last 10d · newest 5 ──"));
-    if let Some(e) = &app.haunt.roadmap_err {
+    lines.push(hdr(&format!(
+        "── roadmap · delivery runs · last {}{} ──",
+        win_label(hp.window_ms),
+        keep_label(hp.keep_per_source)
+    )));
+    if let Some(e) = &v.haunt.roadmap_err {
         lines.push(err_line(e));
     } else {
-        let rs: Vec<_> = app.haunt.runs.iter().filter(|r| r.source == "roadmap").collect();
+        let rs: Vec<_> = v.haunt.runs.iter().filter(|r| r.source == "roadmap").collect();
         if rs.is_empty() {
             lines.push(none_line());
         }
@@ -1365,11 +1400,15 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── sites · maintenance runs · last 10d · newest 5 ──"));
-    if let Some(e) = &app.haunt.sites_err {
+    lines.push(hdr(&format!(
+        "── sites · maintenance runs · last {}{} ──",
+        win_label(hp.window_ms),
+        keep_label(hp.keep_per_source)
+    )));
+    if let Some(e) = &v.haunt.sites_err {
         lines.push(err_line(e));
     } else {
-        let rs: Vec<_> = app.haunt.runs.iter().filter(|r| r.source == "sites").collect();
+        let rs: Vec<_> = v.haunt.runs.iter().filter(|r| r.source == "sites").collect();
         if rs.is_empty() {
             lines.push(none_line());
         }
@@ -1378,17 +1417,22 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         }
     }
 
-    let total = lines.len();
-    let (start, end) = window(app, PaneId::GitHub, total, h);
-    let visible = lines[start..end].to_vec();
-    let updated = if app.gh.fetching {
+    let updated = if v.gh.fetching {
         "refreshing…".to_string()
-    } else if app.gh.fetched_at_ms > 0 {
-        format!("updated {} ago", fmt_dur(now - app.gh.fetched_at_ms))
+    } else if v.gh.fetched_at_ms > 0 {
+        format!("updated {} ago", fmt_dur(now - v.gh.fetched_at_ms))
     } else {
         "".to_string()
     };
-    let block = pane_block(app, PaneId::GitHub, format!("github + haunt · {updated}"), accent);
+    let total = lines.len();
+    let (start, end) = window(app, PaneId::GitHub, total, h);
+    let visible = lines[start..end].to_vec();
+    let label = match mode {
+        GhMode::Live => "live",
+        GhMode::Digest => "10d digest",
+    };
+    let title = format!("github + haunt · {label} · {updated}");
+    let block = pane_block(app, PaneId::GitHub, title, accent);
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
 

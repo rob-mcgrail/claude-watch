@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
@@ -427,17 +427,106 @@ pub struct App {
     pub overview_ranges: Vec<(usize, usize)>,
     last_overview_scan: Instant,
 
-    // github + haunt activity (view g)
+    // github + haunt activity (view g / space)
+    pub gh_mode: GhMode,
+    gh_views: [GhView; 2],
+    gh_tx: Sender<GhMsg>,
+    gh_rx: Receiver<GhMsg>,
+    last_gcache_check: Instant,
+}
+
+/// The g view has two modes over the same sources: `g` for what is happening
+/// right now, space for a digest of the last 10 days. Each keeps its own state
+/// and its own cache file, so switching between them never refetches.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum GhMode {
+    Live,
+    Digest,
+}
+
+impl GhMode {
+    pub const ALL: [GhMode; 2] = [GhMode::Live, GhMode::Digest];
+
+    fn idx(self) -> usize {
+        match self {
+            GhMode::Live => 0,
+            GhMode::Digest => 1,
+        }
+    }
+
+    /// Cache-file tag, and the label in the pane title.
+    pub fn tag(self) -> &'static str {
+        match self {
+            GhMode::Live => "live",
+            GhMode::Digest => "digest",
+        }
+    }
+
+    pub fn gh_params(self) -> crate::gh::Params {
+        match self {
+            GhMode::Live => crate::gh::Params::LIVE,
+            GhMode::Digest => crate::gh::Params::DIGEST,
+        }
+    }
+
+    pub fn haunt_params(self) -> crate::haunt::Params {
+        match self {
+            GhMode::Live => crate::haunt::Params::LIVE,
+            GhMode::Digest => crate::haunt::Params::DIGEST,
+        }
+    }
+
+    /// The live feed goes stale in a couple of minutes; a 10-day digest does not.
+    fn ttl_secs(self) -> i64 {
+        match self {
+            GhMode::Live => 120,
+            GhMode::Digest => 600,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct GhView {
     pub gh: crate::gh::GhState,
     pub haunt: crate::haunt::HauntState,
-    gh_rx: Option<Receiver<(crate::gh::FetchResult, crate::haunt::HauntState)>>,
-    last_gh_refresh: Instant,
-    last_gcache_check: Instant,
+    /// When a fetch was last *started*, successful or not. A fetch that loses
+    /// the cross-instance lock leaves the data stale, so without this the
+    /// staleness check in `tick` would respawn it every frame.
+    last_attempt: Option<Instant>,
+}
+
+struct GhMsg {
+    mode: GhMode,
+    /// None when another instance held the fetch lock — nothing fetched, and
+    /// the pane's spinner needs clearing either way.
+    data: Option<(crate::gh::FetchResult, crate::haunt::HauntState)>,
+}
+
+/// Fetch one mode on the calling (background) thread and hand the result back.
+/// One fetcher per mode across all instances; instances that lose the lock pick
+/// the winner's result up from the cache via the 3s poll in `tick`.
+fn fetch_mode(mode: GhMode, tx: &Sender<GhMsg>) {
+    if !crate::gcache::try_lock(mode.tag()) {
+        let _ = tx.send(GhMsg { mode, data: None });
+        return;
+    }
+    let gh_params = mode.gh_params();
+    let gh_handle = std::thread::spawn(move || crate::gh::fetch(gh_params));
+    let h = crate::haunt::fetch(mode.haunt_params());
+    let g = gh_handle.join().unwrap_or_else(|_| crate::gh::FetchResult {
+        runs: vec![],
+        prs: vec![],
+        error: Some("gh fetch panicked".into()),
+    });
+    crate::gcache::store(mode.tag(), &g, &h);
+    crate::gcache::unlock(mode.tag());
+    let _ = tx.send(GhMsg { mode, data: Some((g, h)) });
 }
 
 impl App {
     pub fn new(cwd: PathBuf, nzd_rate: f64, ctx_window: u64) -> Self {
         let hooks_config = load_hook_config(&cwd);
+        let (gh_tx, gh_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             cwd,
             nzd_rate,
@@ -498,10 +587,10 @@ impl App {
             overview_top: 0,
             overview_ranges: Vec::new(),
             last_overview_scan: Instant::now(),
-            gh: Default::default(),
-            haunt: Default::default(),
-            gh_rx: None,
-            last_gh_refresh: Instant::now(),
+            gh_mode: GhMode::Live,
+            gh_views: Default::default(),
+            gh_tx,
+            gh_rx,
             last_gcache_check: Instant::now(),
         };
         app.sessions = discover::discover_sessions(&app.cwd);
@@ -643,29 +732,15 @@ impl App {
         }
         if self.layout == 7 && self.last_gcache_check.elapsed() > Duration::from_secs(3) {
             self.last_gcache_check = Instant::now();
-            self.load_gcache();
+            self.load_gcache(self.gh_mode);
         }
-        if self.layout == 7
-            && self.gh_rx.is_none()
-            && (self.gh.fetched_at_ms == 0
-                || self.last_gh_refresh.elapsed() > Duration::from_secs(120))
-        {
-            self.gh_refresh();
+        // only the mode on screen auto-refreshes; the other keeps what it has
+        // until you switch to it
+        if self.layout == 7 && self.gh_stale(self.gh_mode) {
+            self.gh_refresh(self.gh_mode);
         }
-        let mut fetched = false;
-        if let Some(rx) = &self.gh_rx {
-            if let Ok((g, h)) = rx.try_recv() {
-                self.gh.runs = g.runs;
-                self.gh.prs = g.prs;
-                self.gh.error = g.error;
-                self.gh.fetched_at_ms = now_ms();
-                self.gh.fetching = false;
-                self.haunt = h;
-                fetched = true;
-            }
-        }
-        if fetched {
-            self.gh_rx = None;
+        while let Ok(msg) = self.gh_rx.try_recv() {
+            self.apply_gh(msg);
         }
         self.drain_tails();
     }
@@ -1683,61 +1758,109 @@ impl App {
         }
     }
 
-    // ---------- view g: github + haunt ----------
+    // ---------- view g / space: github + haunt ----------
 
-    pub fn gh_refresh_if_stale(&mut self, secs: i64) {
-        if self.gh.fetched_at_ms == 0 || now_ms() - self.gh.fetched_at_ms > secs * 1000 {
-            self.gh_refresh();
+    pub fn ghv(&self) -> &GhView {
+        &self.gh_views[self.gh_mode.idx()]
+    }
+
+    fn view_mut(&mut self, m: GhMode) -> &mut GhView {
+        &mut self.gh_views[m.idx()]
+    }
+
+    fn gh_stale(&self, m: GhMode) -> bool {
+        let at = self.gh_views[m.idx()].gh.fetched_at_ms;
+        at == 0 || now_ms() - at > m.ttl_secs() * 1000
+    }
+
+    /// Switch to a mode and show it immediately from whatever is already in
+    /// memory or on disk; any refetch happens behind the rendered data.
+    pub fn gh_open(&mut self, m: GhMode) {
+        self.layout = 7;
+        self.focus = PaneId::GitHub;
+        if self.gh_mode != m {
+            self.gh_mode = m;
+            self.scroll.insert(PaneId::GitHub, 0);
+        }
+        self.load_gcache(m);
+        if self.gh_stale(m) {
+            self.gh_refresh(m);
         }
     }
 
-    /// Adopt the shared cache if another instance wrote something newer.
-    fn load_gcache(&mut self) {
-        if let Some(c) = crate::gcache::load() {
-            if c.fetched_at_ms > self.gh.fetched_at_ms {
-                self.gh.runs = c.runs;
-                self.gh.prs = c.prs;
-                self.gh.error = c.gh_error;
-                self.gh.fetched_at_ms = c.fetched_at_ms;
-                self.haunt = crate::haunt::HauntState {
-                    runs: c.haunt_runs,
-                    roadmap_err: c.roadmap_err,
-                    sites_err: c.sites_err,
-                };
+    /// Claim the right to start a fetch for this mode, marking it in flight.
+    fn gh_claim(&mut self, m: GhMode) -> bool {
+        let v = &self.gh_views[m.idx()];
+        let backoff = v
+            .last_attempt
+            .map(|t| t.elapsed() < Duration::from_secs(10))
+            .unwrap_or(false);
+        if v.gh.fetching || backoff {
+            return false;
+        }
+        let v = self.view_mut(m);
+        v.gh.fetching = true;
+        v.last_attempt = Some(Instant::now());
+        true
+    }
+
+    /// Populate both modes at startup so the first switch either way is instant.
+    /// The two fetches share one thread — sequential keeps the burst of `gh`
+    /// subprocesses to what a single mode already costs.
+    pub fn gh_boot(&mut self) {
+        let mut need = Vec::new();
+        for m in GhMode::ALL {
+            self.load_gcache(m);
+            if self.gh_stale(m) && self.gh_claim(m) {
+                need.push(m);
             }
         }
+        if need.is_empty() {
+            return;
+        }
+        let tx = self.gh_tx.clone();
+        std::thread::spawn(move || {
+            for m in need {
+                fetch_mode(m, &tx);
+            }
+        });
     }
 
-    pub fn gh_refresh(&mut self) {
-        self.load_gcache();
-        if self.gh.fetching {
+    /// Adopt this mode's cache if another instance wrote something newer.
+    fn load_gcache(&mut self, m: GhMode) {
+        let Some(c) = crate::gcache::load(m.tag()) else { return };
+        let v = self.view_mut(m);
+        if c.fetched_at_ms > v.gh.fetched_at_ms {
+            v.gh.runs = c.runs;
+            v.gh.prs = c.prs;
+            v.gh.error = c.gh_error;
+            v.gh.fetched_at_ms = c.fetched_at_ms;
+            v.haunt = crate::haunt::HauntState {
+                runs: c.haunt_runs,
+                roadmap_err: c.roadmap_err,
+                sites_err: c.sites_err,
+            };
+        }
+    }
+
+    pub fn gh_refresh(&mut self, m: GhMode) {
+        if !self.gh_claim(m) {
             return;
         }
-        // cache (possibly from another instance) is fresh enough — no network
-        if self.gh.fetched_at_ms > 0 && now_ms() - self.gh.fetched_at_ms < 60_000 {
-            return;
+        let tx = self.gh_tx.clone();
+        std::thread::spawn(move || fetch_mode(m, &tx));
+    }
+
+    fn apply_gh(&mut self, msg: GhMsg) {
+        let v = self.view_mut(msg.mode);
+        v.gh.fetching = false;
+        if let Some((g, h)) = msg.data {
+            v.gh.runs = g.runs;
+            v.gh.prs = g.prs;
+            v.gh.error = g.error;
+            v.gh.fetched_at_ms = now_ms();
+            v.haunt = h;
         }
-        // one fetcher across all instances; others pick the result up
-        // from the cache via the 3s poll in tick()
-        if !crate::gcache::try_lock() {
-            return;
-        }
-        self.gh.fetching = true;
-        self.last_gh_refresh = Instant::now();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.gh_rx = Some(rx);
-        std::thread::spawn(move || {
-            let gh_handle = std::thread::spawn(crate::gh::fetch);
-            let h = crate::haunt::fetch();
-            let g = gh_handle.join().unwrap_or_else(|_| crate::gh::FetchResult {
-                runs: vec![],
-                prs: vec![],
-                error: Some("gh fetch panicked".into()),
-            });
-            crate::gcache::store(&g, &h);
-            crate::gcache::unlock();
-            let _ = tx.send((g, h));
-        });
     }
 
     // ---------- debug ----------
