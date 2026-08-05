@@ -1329,7 +1329,8 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
             match p.state.to_ascii_uppercase().as_str() {
                 "OPEN" => ("○", Style::default().fg(Color::Green)),
                 "MERGED" => ("⇄", Style::default().fg(Color::Magenta)),
-                _ => ("✗", Style::default().fg(Color::Red)),
+                // closed-unmerged is not a failure, just done with
+                _ => ("⊘", Style::default().fg(Color::DarkGray)),
             }
         };
         lines.push(Line::from(vec![

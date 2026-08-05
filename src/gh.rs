@@ -190,7 +190,16 @@ pub fn fetch() -> FetchResult {
             });
         }
     }
-    prs.sort_by_key(|p| -p.created_ms);
+    // open PRs need attention, merged ones are useful signal, closed ones
+    // are noise — rank by state first, recency within each
+    prs.sort_by_key(|p| {
+        let rank = match p.state.to_ascii_uppercase().as_str() {
+            "OPEN" => 0,
+            "MERGED" => 1,
+            _ => 2,
+        };
+        (rank, -p.created_ms)
+    });
 
     FetchResult { runs, prs, error }
 }
