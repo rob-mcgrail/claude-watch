@@ -61,7 +61,7 @@ fn parse_flex_ms(t: &str) -> i64 {
 /// Blocking fetch of roadmap + sites delivery runs — background thread only.
 pub fn fetch() -> HauntState {
     let now = now_ms();
-    let six_h = 6 * 3_600_000i64;
+    let window = 12 * 3_600_000i64;
     let mut st = HauntState::default();
     let empty = vec![];
 
@@ -71,7 +71,7 @@ pub fn fetch() -> HauntState {
             for r in v.as_array().unwrap_or(&empty) {
                 let started = parse_flex_ms(s(r, "started_at"));
                 let running = r.get("finished_at").map(|x| x.is_null()).unwrap_or(true);
-                if !running && now - started > six_h {
+                if !running && now - started > window {
                     continue;
                 }
                 let exit = r.get("exit_code").and_then(|x| x.as_i64());
@@ -127,7 +127,7 @@ pub fn fetch() -> HauntState {
                     let unfinished = r.get("completed_at").map(|x| x.is_null()).unwrap_or(false);
                     let running =
                         unfinished && matches!(status.as_str(), "in_progress" | "pending" | "blocked");
-                    if !running && now - created > six_h {
+                    if !running && now - created > window {
                         continue;
                     }
                     let nstories = r
