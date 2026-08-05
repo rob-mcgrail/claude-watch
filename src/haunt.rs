@@ -2,10 +2,13 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::{now_ms, truncate_chars};
 
+#[derive(Serialize, Deserialize)]
 pub struct HauntRun {
-    pub source: &'static str, // "roadmap" | "sites"
+    pub source: String, // "roadmap" | "sites"
     pub label: String,        // project slug / site repo name
     pub what: String,         // run mode + stories / maintenance task
     pub status: String,
@@ -73,7 +76,7 @@ pub fn fetch() -> HauntState {
                 }
                 let exit = r.get("exit_code").and_then(|x| x.as_i64());
                 st.runs.push(HauntRun {
-                    source: "sites",
+                    source: "sites".to_string(),
                     label: s(r, "repo_name").to_string(),
                     what: s(r, "task").to_string(),
                     status: if running {
@@ -138,7 +141,7 @@ pub fn fetch() -> HauntState {
                         s(r, "mode").to_string()
                     };
                     st.runs.push(HauntRun {
-                        source: "roadmap",
+                        source: "roadmap".to_string(),
                         label: slug.clone(),
                         what,
                         status: status.clone(),

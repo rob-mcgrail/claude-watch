@@ -432,6 +432,7 @@ pub struct App {
     pub haunt: crate::haunt::HauntState,
     gh_rx: Option<Receiver<(crate::gh::FetchResult, crate::haunt::HauntState)>>,
     last_gh_refresh: Instant,
+    last_gcache_check: Instant,
 }
 
 impl App {
@@ -501,6 +502,7 @@ impl App {
             haunt: Default::default(),
             gh_rx: None,
             last_gh_refresh: Instant::now(),
+            last_gcache_check: Instant::now(),
         };
         app.sessions = discover::discover_sessions(&app.cwd);
         if !app.sessions.is_empty() {
@@ -638,6 +640,10 @@ impl App {
         if self.layout == 0 && self.last_overview_scan.elapsed() > Duration::from_secs(5) {
             self.last_overview_scan = Instant::now();
             self.refresh_overview();
+        }
+        if self.layout == 7 && self.last_gcache_check.elapsed() > Duration::from_secs(3) {
+            self.last_gcache_check = Instant::now();
+            self.load_gcache();
         }
         if self.layout == 7
             && self.gh_rx.is_none()
@@ -1667,8 +1673,35 @@ impl App {
         }
     }
 
+    /// Adopt the shared cache if another instance wrote something newer.
+    fn load_gcache(&mut self) {
+        if let Some(c) = crate::gcache::load() {
+            if c.fetched_at_ms > self.gh.fetched_at_ms {
+                self.gh.runs = c.runs;
+                self.gh.prs = c.prs;
+                self.gh.error = c.gh_error;
+                self.gh.fetched_at_ms = c.fetched_at_ms;
+                self.haunt = crate::haunt::HauntState {
+                    runs: c.haunt_runs,
+                    roadmap_err: c.roadmap_err,
+                    sites_err: c.sites_err,
+                };
+            }
+        }
+    }
+
     pub fn gh_refresh(&mut self) {
+        self.load_gcache();
         if self.gh.fetching {
+            return;
+        }
+        // cache (possibly from another instance) is fresh enough — no network
+        if self.gh.fetched_at_ms > 0 && now_ms() - self.gh.fetched_at_ms < 60_000 {
+            return;
+        }
+        // one fetcher across all instances; others pick the result up
+        // from the cache via the 3s poll in tick()
+        if !crate::gcache::try_lock() {
             return;
         }
         self.gh.fetching = true;
@@ -1683,6 +1716,8 @@ impl App {
                 prs: vec![],
                 error: Some("gh fetch panicked".into()),
             });
+            crate::gcache::store(&g, &h);
+            crate::gcache::unlock();
             let _ = tx.send((g, h));
         });
     }

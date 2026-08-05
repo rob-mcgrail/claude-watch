@@ -1,5 +1,6 @@
 mod app;
 mod discover;
+mod gcache;
 mod gh;
 mod haunt;
 mod overview;

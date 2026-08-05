@@ -2,8 +2,11 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app::now_ms;
 
+#[derive(Serialize, Deserialize)]
 pub struct GhRun {
     pub repo: String,
     pub workflow: String,
@@ -13,6 +16,7 @@ pub struct GhRun {
     pub created_ms: i64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct GhPr {
     pub repo: String,
     pub number: u64,
