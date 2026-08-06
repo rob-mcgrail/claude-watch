@@ -431,8 +431,6 @@ pub struct App {
 
     // github + haunt activity (view g / space)
     pub gh_mode: GhMode,
-    /// Where space was pressed from, so pressing it again puts you back.
-    gh_prev: Option<(u8, PaneId, GhMode)>,
     // dependabot across the managed sites (view v)
     pub cve: crate::cve::CveState,
     cve_tx: Sender<crate::cve::CveState>,
@@ -606,7 +604,6 @@ impl App {
             overview_ranges: Vec::new(),
             last_overview_scan: Instant::now(),
             gh_mode: GhMode::Live,
-            gh_prev: None,
             cve: Default::default(),
             cve_tx,
             cve_rx,
@@ -1852,25 +1849,17 @@ impl App {
         }
     }
 
-    /// Space is a round trip, not a one-way door: it peeks at the digest and,
-    /// pressed again, drops you back in the view you came from — including the
-    /// live mode of this same pane.
+    /// Space switches the g view between its two modes. It is a modifier on
+    /// that pane, not a way into it — pressed anywhere else it does nothing.
     pub fn gh_toggle_digest(&mut self) {
-        if self.layout == 7 && self.gh_mode == GhMode::Digest {
-            let (layout, focus, mode) = self.gh_prev.take().unwrap_or((1, PaneId::Thinking, GhMode::Live));
-            self.layout = layout;
-            self.focus = focus;
-            if self.gh_mode != mode {
-                self.gh_mode = mode;
-                self.scroll.insert(PaneId::GitHub, 0);
-            }
-            if layout == 7 {
-                self.load_gcache(mode);
-            }
-        } else {
-            self.gh_prev = Some((self.layout, self.focus, self.gh_mode));
-            self.gh_open(GhMode::Digest);
+        if self.layout != 7 {
+            return;
         }
+        let next = match self.gh_mode {
+            GhMode::Digest => GhMode::Live,
+            GhMode::Live => GhMode::Digest,
+        };
+        self.gh_open(next);
     }
 
     /// Claim the right to start a fetch for this mode, marking it in flight.

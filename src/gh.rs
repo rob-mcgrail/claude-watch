@@ -93,8 +93,8 @@ impl Params {
         repo_window_ms: 10 * 24 * HOUR,
         run_window_ms: 10 * 24 * HOUR,
         pr_window_ms: 10 * 24 * HOUR,
-        keep_runs: 10,
-        keep_prs: 10,
+        keep_runs: 15,
+        keep_prs: 15,
     };
 }
 
