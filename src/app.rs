@@ -156,6 +156,7 @@ pub enum PaneId {
     ToolIO,
     Overview,
     GitHub,
+    Cve,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -431,6 +432,11 @@ pub struct App {
     pub gh_mode: GhMode,
     /// Where space was pressed from, so pressing it again puts you back.
     gh_prev: Option<(u8, PaneId, GhMode)>,
+    // dependabot across the managed sites (view v)
+    pub cve: crate::cve::CveState,
+    cve_tx: Sender<crate::cve::CveState>,
+    cve_rx: Receiver<crate::cve::CveState>,
+    cve_attempt: Option<Instant>,
     gh_views: [GhView; 2],
     gh_tx: Sender<GhMsg>,
     gh_rx: Receiver<GhMsg>,
@@ -529,6 +535,7 @@ impl App {
     pub fn new(cwd: PathBuf, nzd_rate: f64, ctx_window: u64) -> Self {
         let hooks_config = load_hook_config(&cwd);
         let (gh_tx, gh_rx) = std::sync::mpsc::channel();
+        let (cve_tx, cve_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             cwd,
             nzd_rate,
@@ -591,6 +598,10 @@ impl App {
             last_overview_scan: Instant::now(),
             gh_mode: GhMode::Live,
             gh_prev: None,
+            cve: Default::default(),
+            cve_tx,
+            cve_rx,
+            cve_attempt: None,
             gh_views: Default::default(),
             gh_tx,
             gh_rx,
@@ -749,6 +760,21 @@ impl App {
         }
         while let Ok(msg) = self.gh_rx.try_recv() {
             self.apply_gh(msg);
+        }
+        while let Ok(st) = self.cve_rx.try_recv() {
+            // an empty result means another instance held the scan lock —
+            // clear the spinner but keep whatever is already on screen
+            if st.fetched_at_ms > 0 {
+                self.cve = st;
+                // content just grew from nothing; re-pin to the top so the
+                // summary is not left scrolled off
+                self.scroll.insert(PaneId::Cve, usize::MAX);
+            } else {
+                self.cve.fetching = false;
+            }
+        }
+        if self.layout == 8 && self.cve_stale() {
+            self.cve_refresh();
         }
         self.drain_tails();
     }
@@ -1878,6 +1904,60 @@ impl App {
         }
         let tx = self.gh_tx.clone();
         std::thread::spawn(move || fetch_mode(m, &tx));
+    }
+
+    // ---------- view v: dependabot across the managed sites ----------
+
+    /// Open the security view, showing whatever is cached while any rescan runs
+    /// behind it. A full scan is ~8s, so it must never be in the way.
+    pub fn cve_open(&mut self) {
+        self.layout = 8;
+        self.focus = PaneId::Cve;
+        // a report reads from the top, unlike the feeds this offset convention
+        // was built for; the render clamps this to "as far up as it goes"
+        self.scroll.insert(PaneId::Cve, usize::MAX);
+        self.load_ccache();
+        if self.cve_stale() {
+            self.cve_refresh();
+        }
+    }
+
+    /// Advisories move on the scale of days, and a scan costs 40 API calls —
+    /// half an hour is generous.
+    fn cve_stale(&self) -> bool {
+        self.cve.fetched_at_ms == 0 || now_ms() - self.cve.fetched_at_ms > 30 * 60_000
+    }
+
+    fn load_ccache(&mut self) {
+        if let Some(c) = crate::gcache::load_cve() {
+            if c.fetched_at_ms > self.cve.fetched_at_ms {
+                self.cve = c;
+            }
+        }
+    }
+
+    pub fn cve_refresh(&mut self) {
+        let backoff = self
+            .cve_attempt
+            .map(|t| t.elapsed() < Duration::from_secs(20))
+            .unwrap_or(false);
+        if self.cve.fetching || backoff {
+            return;
+        }
+        self.cve.fetching = true;
+        self.cve_attempt = Some(Instant::now());
+        let tx = self.cve_tx.clone();
+        std::thread::spawn(move || {
+            if !crate::gcache::try_lock("cve") {
+                let _ = tx.send(crate::cve::CveState::default());
+                return;
+            }
+            let mut st = crate::cve::fetch();
+            crate::gcache::store_cve(&st);
+            crate::gcache::unlock("cve");
+            st.fetching = false;
+            let _ = tx.send(st);
+        });
     }
 
     fn apply_gh(&mut self, msg: GhMsg) {

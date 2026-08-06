@@ -24,6 +24,7 @@ pub fn pane_label(p: PaneId) -> &'static str {
         PaneId::Skills => "skills",
         PaneId::Overview => "sessions",
         PaneId::GitHub => "github",
+        PaneId::Cve => "security",
     }
 }
 
@@ -140,6 +141,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.layout {
         0 => render_overview(f, app, rows[0], accent),
         7 => render_github(f, app, rows[0], accent),
+        8 => render_cve(f, app, rows[0], accent),
         2 => layout_ops(f, app, rows[0], accent),
         3 => render_feed(f, app, rows[0], accent),
         4 => render_toolio(f, app, rows[0], accent),
@@ -1434,6 +1436,133 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     };
     let title = format!("github + haunt · {label} · {updated}");
     let block = pane_block(app, PaneId::GitHub, title, accent);
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+/// Dependabot across the sites registry. Rolled up per advisory rather than
+/// listed per alert: the same CVE in fourteen sites is one fix, not fourteen.
+fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Cve, rect));
+    let h = inner_h(rect);
+    let now = now_ms();
+    let hdr = |t: &str| {
+        Line::from(Span::styled(
+            t.to_string(),
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let c = &app.cve;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if c.fetching && c.fetched_at_ms == 0 {
+        lines.push(Line::from(Span::styled(
+            format!("⋯ scanning {} managed sites…", c.sites_scanned.max(40)),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(e) = &c.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {}", truncate_chars(e, 110)),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if c.fetched_at_ms > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} critical", c.critical),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {} high", c.total.saturating_sub(c.critical)),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!(
+                    " · {} distinct CVEs · {}/{} sites affected",
+                    c.distinct, c.sites_affected, c.sites_scanned
+                ),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── worst CVEs · critical first, then blast radius ──"));
+    if c.worst.is_empty() && c.fetched_at_ms > 0 {
+        lines.push(Line::from(Span::styled(
+            "  · none".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for r in &c.worst {
+        let (mark, st) = if r.severity == "critical" {
+            ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        } else {
+            ("▲", Style::default().fg(Color::Yellow))
+        };
+        // an unscored advisory is not a zero-risk one — say so rather than
+        // printing a 0.0 that reads as "harmless"
+        let score = if r.cvss > 0.0 {
+            format!("{:>4.1}", r.cvss)
+        } else {
+            "   —".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {mark} "), st),
+            Span::styled(
+                format!("{:<18}", truncate_chars(&r.id, 18)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {score} "), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:<22}", truncate_chars(&r.package, 22)),
+                Style::default().fg(Color::LightCyan),
+            ),
+            Span::styled(
+                format!(" {:>2} sites", r.sites),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                format!(" · open {}", fmt_dur(now - r.oldest_ms)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── worst sites ──"));
+    for s in &c.by_site {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<26}", truncate_chars(&s.repo, 26)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:>4} critical", s.critical),
+                Style::default().fg(Color::Red),
+            ),
+            Span::styled(
+                format!(" · {:>4} high", s.high),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+
+    let updated = match (c.fetching, c.fetched_at_ms) {
+        (true, 0) => "scanning…".to_string(),
+        (true, at) => format!("scanned {} ago · rescanning…", fmt_dur(now - at)),
+        (false, 0) => String::new(),
+        (false, at) => format!("scanned {} ago", fmt_dur(now - at)),
+    };
+    let total = lines.len();
+    let (start, end) = window(app, PaneId::Cve, total, h);
+    let visible = lines[start..end].to_vec();
+    let block = pane_block(
+        app,
+        PaneId::Cve,
+        format!("security · dependabot · managed sites · {updated}"),
+        accent,
+    );
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
 
