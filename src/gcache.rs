@@ -96,6 +96,23 @@ pub fn store_cve(st: &crate::cve::CveState) {
     }
 }
 
+/// The sites registry caches whole — it is one cheap CLI call, cached only so
+/// the panel opens instantly.
+pub fn load_sites() -> Option<crate::sitelist::SitesState> {
+    let txt = fs::read_to_string(dir().join("sites.json")).ok()?;
+    serde_json::from_str(&txt).ok()
+}
+
+pub fn store_sites(st: &crate::sitelist::SitesState) {
+    let _ = fs::create_dir_all(dir());
+    if let Ok(json) = serde_json::to_string(st) {
+        let tmp = dir().join("sites.json.tmp");
+        if fs::write(&tmp, json).is_ok() {
+            let _ = fs::rename(&tmp, dir().join("sites.json"));
+        }
+    }
+}
+
 /// One fetcher at a time across all instances; stale locks (crashed
 /// writers) are stolen after 3 minutes.
 pub fn try_lock(mode: &str) -> bool {

@@ -157,6 +157,7 @@ pub enum PaneId {
     Overview,
     GitHub,
     Cve,
+    Sites,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -437,6 +438,13 @@ pub struct App {
     cve_tx: Sender<crate::cve::CveState>,
     cve_rx: Receiver<crate::cve::CveState>,
     cve_attempt: Option<Instant>,
+    /// 0 = every ecosystem, then one per entry in `cve.ecosystems`.
+    pub cve_eco: usize,
+    // sites registry (view m)
+    pub sites_reg: crate::sitelist::SitesState,
+    sites_tx: Sender<crate::sitelist::SitesState>,
+    sites_rx: Receiver<crate::sitelist::SitesState>,
+    sites_attempt: Option<Instant>,
     gh_views: [GhView; 2],
     gh_tx: Sender<GhMsg>,
     gh_rx: Receiver<GhMsg>,
@@ -536,6 +544,7 @@ impl App {
         let hooks_config = load_hook_config(&cwd);
         let (gh_tx, gh_rx) = std::sync::mpsc::channel();
         let (cve_tx, cve_rx) = std::sync::mpsc::channel();
+        let (sites_tx, sites_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             cwd,
             nzd_rate,
@@ -602,6 +611,11 @@ impl App {
             cve_tx,
             cve_rx,
             cve_attempt: None,
+            cve_eco: 0,
+            sites_reg: Default::default(),
+            sites_tx,
+            sites_rx,
+            sites_attempt: None,
             gh_views: Default::default(),
             gh_tx,
             gh_rx,
@@ -769,12 +783,28 @@ impl App {
                 // content just grew from nothing; re-pin to the top so the
                 // summary is not left scrolled off
                 self.scroll.insert(PaneId::Cve, usize::MAX);
+                // a rescan can drop an ecosystem entirely
+                if self.cve_eco >= self.cve.eco_count() {
+                    self.cve_eco = 0;
+                }
             } else {
                 self.cve.fetching = false;
             }
         }
         if self.layout == 8 && self.cve_stale() {
             self.cve_refresh();
+        }
+        while let Ok(st) = self.sites_rx.try_recv() {
+            let keep_err = st.error.clone();
+            if !st.rows.is_empty() || keep_err.is_some() {
+                self.sites_reg = st;
+            } else {
+                self.sites_reg.fetching = false;
+            }
+            self.scroll.insert(PaneId::Sites, usize::MAX);
+        }
+        if self.layout == 9 && self.sites_stale() {
+            self.sites_refresh();
         }
         self.drain_tails();
     }
@@ -1881,6 +1911,16 @@ impl App {
         });
     }
 
+    /// Warm the security scan at startup too, so the first `s` is instant. It
+    /// is the slowest of the three fetches, hence its own thread rather than a
+    /// place in the g-view chain.
+    pub fn cve_boot(&mut self) {
+        self.load_ccache();
+        if self.cve_stale() {
+            self.cve_refresh();
+        }
+    }
+
     /// Adopt this mode's cache if another instance wrote something newer.
     fn load_gcache(&mut self, m: GhMode) {
         let Some(c) = crate::gcache::load(m.tag()) else { return };
@@ -1911,15 +1951,27 @@ impl App {
     /// Open the security view, showing whatever is cached while any rescan runs
     /// behind it. A full scan is ~8s, so it must never be in the way.
     pub fn cve_open(&mut self) {
+        // pressing s on the view already showing means "rescan now"
+        let rescan = self.layout == 8;
         self.layout = 8;
         self.focus = PaneId::Cve;
         // a report reads from the top, unlike the feeds this offset convention
         // was built for; the render clamps this to "as far up as it goes"
         self.scroll.insert(PaneId::Cve, usize::MAX);
         self.load_ccache();
-        if self.cve_stale() {
+        if rescan || self.cve_stale() {
             self.cve_refresh();
         }
+    }
+
+    /// Cycle the ecosystem filter — all → npm → composer → rubygems → all.
+    pub fn cycle_cve_eco(&mut self, dir: i64) {
+        let n = self.cve.eco_count() as i64;
+        if n <= 1 {
+            return;
+        }
+        self.cve_eco = (self.cve_eco as i64 + dir).rem_euclid(n) as usize;
+        self.scroll.insert(PaneId::Cve, usize::MAX);
     }
 
     /// Advisories move on the scale of days, and a scan costs 40 API calls —
@@ -1955,6 +2007,63 @@ impl App {
             let mut st = crate::cve::fetch();
             crate::gcache::store_cve(&st);
             crate::gcache::unlock("cve");
+            st.fetching = false;
+            let _ = tx.send(st);
+        });
+    }
+
+    // ---------- view m: the sites registry ----------
+
+    /// Same contract as the security view: instant from cache, and pressing the
+    /// key again on the view already showing forces a reload.
+    pub fn sites_open(&mut self) {
+        let reload = self.layout == 9;
+        self.layout = 9;
+        self.focus = PaneId::Sites;
+        self.scroll.insert(PaneId::Sites, usize::MAX);
+        self.load_scache();
+        if reload || self.sites_stale() {
+            self.sites_refresh();
+        }
+    }
+
+    pub fn sites_boot(&mut self) {
+        self.load_scache();
+        if self.sites_stale() {
+            self.sites_refresh();
+        }
+    }
+
+    /// The registry moves when someone patches a site — minutes, not seconds.
+    fn sites_stale(&self) -> bool {
+        self.sites_reg.fetched_at_ms == 0
+            || now_ms() - self.sites_reg.fetched_at_ms > 10 * 60_000
+    }
+
+    fn load_scache(&mut self) {
+        if let Some(c) = crate::gcache::load_sites() {
+            if c.fetched_at_ms > self.sites_reg.fetched_at_ms {
+                self.sites_reg = c;
+            }
+        }
+    }
+
+    pub fn sites_refresh(&mut self) {
+        let backoff = self
+            .sites_attempt
+            .map(|t| t.elapsed() < Duration::from_secs(3))
+            .unwrap_or(false);
+        if self.sites_reg.fetching || backoff {
+            return;
+        }
+        self.sites_reg.fetching = true;
+        self.sites_attempt = Some(Instant::now());
+        let tx = self.sites_tx.clone();
+        std::thread::spawn(move || {
+            let mut st = crate::sitelist::fetch();
+            if st.error.is_none() {
+                crate::gcache::store_sites(&st);
+            }
             st.fetching = false;
             let _ = tx.send(st);
         });

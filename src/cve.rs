@@ -6,11 +6,11 @@ use serde_json::Value;
 
 use crate::app::{now_ms, truncate_chars};
 
-/// One CVE as it lands across the estate. The org-wide Dependabot endpoint
+/// One advisory as it lands across the estate. The org-wide Dependabot endpoint
 /// returns tens of thousands of alerts — most of them against throwaway repos —
 /// so this is scoped to the sites registry and rolled up per advisory: the same
 /// CVE in fourteen sites is one row with a blast radius, not fourteen rows.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CveRollup {
     pub id: String, // CVE-… , or the GHSA id when no CVE is assigned
     pub severity: String,
@@ -21,22 +21,39 @@ pub struct CveRollup {
     pub oldest_ms: i64,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct SiteTally {
+/// Counts per (site, ecosystem) rather than per site, so the ecosystem filter
+/// can re-tally without another scan.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SiteEco {
     pub repo: String,
+    pub ecosystem: String,
     pub critical: usize,
     pub high: usize,
 }
 
+/// Head of a repo's deploy-production branch — what actually went out, and when.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Deploy {
+    pub repo: String,
+    pub when_ms: i64,
+    pub author: String,
+    pub subject: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct CveState {
-    pub worst: Vec<CveRollup>,
-    pub by_site: Vec<SiteTally>,
-    pub total: usize,
-    pub critical: usize,
-    pub distinct: usize,
+    /// Every rollup, not just the visible ones — the ecosystem filter narrows
+    /// this at render time, and re-scanning to change filter would be absurd.
+    pub rollups: Vec<CveRollup>,
+    pub site_eco: Vec<SiteEco>,
+    /// Ecosystems present, most alerts first; the `<`/`>` filter cycles these.
+    pub ecosystems: Vec<String>,
+    pub deploys: Vec<Deploy>,
     pub sites_scanned: usize,
-    pub sites_affected: usize,
+    /// Registry entries GitHub would not show us — renamed, deleted, or private
+    /// to this token. Worth a footnote, not a red warning.
+    #[serde(default)]
+    pub unreadable: usize,
     #[serde(skip)]
     pub error: Option<String>,
     #[serde(skip)]
@@ -47,10 +64,71 @@ pub struct CveState {
     pub fetched_at_ms: i64,
 }
 
+/// What the panel shows for one ecosystem selection.
+pub struct Filtered {
+    pub worst: Vec<CveRollup>,
+    pub by_site: Vec<(String, usize, usize)>,
+    pub total: usize,
+    pub critical: usize,
+    pub distinct: usize,
+    pub sites_affected: usize,
+}
+
+impl CveState {
+    /// Label for a filter index: 0 is everything, then one per ecosystem.
+    pub fn eco_label(&self, idx: usize) -> String {
+        if idx == 0 {
+            "all".to_string()
+        } else {
+            self.ecosystems.get(idx - 1).cloned().unwrap_or_else(|| "all".to_string())
+        }
+    }
+
+    pub fn eco_count(&self) -> usize {
+        self.ecosystems.len() + 1
+    }
+
+    /// Re-derive the visible rows for one ecosystem selection. Cheap enough to
+    /// run every frame: a few hundred rollups and a few dozen tallies.
+    pub fn filtered(&self, idx: usize, keep_cves: usize, keep_sites: usize) -> Filtered {
+        let eco = (idx > 0).then(|| self.eco_label(idx));
+        let keep = |e: &str| eco.as_deref().map(|f| f == e).unwrap_or(true);
+
+        let mut worst: Vec<CveRollup> =
+            self.rollups.iter().filter(|r| keep(&r.ecosystem)).cloned().collect();
+        let distinct = worst.len();
+        worst.truncate(keep_cves);
+
+        let mut tally: HashMap<&str, (usize, usize)> = HashMap::new();
+        for s in self.site_eco.iter().filter(|s| keep(&s.ecosystem)) {
+            let e = tally.entry(s.repo.as_str()).or_insert((0, 0));
+            e.0 += s.critical;
+            e.1 += s.high;
+        }
+        let critical: usize = tally.values().map(|(c, _)| c).sum();
+        let high: usize = tally.values().map(|(_, h)| h).sum();
+        let sites_affected = tally.values().filter(|(c, h)| c + h > 0).count();
+        let mut by_site: Vec<(String, usize, usize)> =
+            tally.into_iter().map(|(r, (c, h))| (r.to_string(), c, h)).collect();
+        by_site.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+        by_site.truncate(keep_sites);
+
+        Filtered {
+            worst,
+            by_site,
+            total: critical + high,
+            critical,
+            distinct,
+            sites_affected,
+        }
+    }
+}
+
 /// How many rows each section keeps.
-const KEEP_CVES: usize = 25;
-const KEEP_SITES: usize = 15;
-/// Concurrent `gh` subprocesses. Eight scans the whole registry in ~8s; more
+pub const KEEP_CVES: usize = 25;
+pub const KEEP_SITES: usize = 15;
+const KEEP_DEPLOYS: usize = 12;
+/// Concurrent `gh` subprocesses. Eight scans the whole registry in ~15s; more
 /// only trades memory for GitHub's secondary rate limiter.
 const FANOUT: usize = 8;
 
@@ -100,7 +178,7 @@ fn registry() -> Result<Vec<(String, String)>, String> {
 
 /// severity, cvss, id, ecosystem, package, created — TSV keeps the payload
 /// small, since the full advisory bodies run to several KB each.
-const JQ: &str = ".[] | [\
+const JQ_ALERTS: &str = ".[] | [\
     .security_advisory.severity, \
     ((.security_advisory.cvss.score // 0) as $v3 | if $v3 > 0 then $v3 else (.security_advisory.cvss_severities.cvss_v4.score // 0) end), \
     (.security_advisory.cve_id // .security_advisory.ghsa_id), \
@@ -108,6 +186,10 @@ const JQ: &str = ".[] | [\
     .dependency.package.name, \
     .created_at\
     ] | @tsv";
+
+const JQ_BRANCH: &str = "[.commit.commit.committer.date, \
+    (.commit.commit.author.name // \"\"), \
+    (.commit.commit.message | split(\"\\n\")[0])] | @tsv";
 
 struct Alert {
     severity: String,
@@ -118,14 +200,9 @@ struct Alert {
     created_ms: i64,
 }
 
-/// Open critical+high alerts for one repo. A repo with Dependabot disabled (or
-/// no alerts) simply yields none — that is not an error worth surfacing.
-fn repo_alerts(owner: &str, repo: &str) -> Result<Vec<Alert>, String> {
-    let path = format!(
-        "/repos/{owner}/{repo}/dependabot/alerts?state=open&severity=critical,high&per_page=100"
-    );
+fn gh_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let out = Command::new("gh")
-        .args(["api", "--paginate", &path, "--jq", JQ])
+        .args(args)
         .output()
         .map_err(|e| format!("gh not runnable: {e}"))?;
     if !out.status.success() {
@@ -133,6 +210,18 @@ fn repo_alerts(owner: &str, repo: &str) -> Result<Vec<Alert>, String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Open critical+high alerts for one repo. A repo with Dependabot disabled (or
+/// no alerts) simply yields none — that is not an error worth surfacing.
+fn repo_alerts(owner: &str, repo: &str) -> Result<Vec<Alert>, String> {
+    let path = format!(
+        "/repos/{owner}/{repo}/dependabot/alerts?state=open&severity=critical,high&per_page=100"
+    );
+    Ok(gh_lines(&["api", "--paginate", &path, "--jq", JQ_ALERTS])?
+        .iter()
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
             if f.len() < 6 {
@@ -150,7 +239,25 @@ fn repo_alerts(owner: &str, repo: &str) -> Result<Vec<Alert>, String> {
         .collect())
 }
 
-/// Blocking scan of every registered site — background thread only, ~8s.
+/// Head of deploy-production, or None when the repo has no such branch. The
+/// registry's `deploy_branches` drifts from what is actually on GitHub — it
+/// listed 31 while 34 repos had the branch — so ask GitHub, not the registry.
+fn repo_deploy(owner: &str, repo: &str) -> Option<Deploy> {
+    let path = format!("/repos/{owner}/{repo}/branches/deploy-production");
+    let lines = gh_lines(&["api", &path, "--jq", JQ_BRANCH]).ok()?;
+    let f: Vec<&str> = lines.first()?.split('\t').collect();
+    if f.len() < 3 {
+        return None;
+    }
+    Some(Deploy {
+        repo: repo.to_string(),
+        when_ms: parse_flex_ms(f[0]),
+        author: f[1].to_string(),
+        subject: f[2].to_string(),
+    })
+}
+
+/// Blocking scan of every registered site — background thread only, ~15s.
 pub fn fetch() -> CveState {
     let mut st = CveState::default();
     let sites = match registry() {
@@ -163,40 +270,59 @@ pub fn fetch() -> CveState {
     st.sites_scanned = sites.len();
 
     // chunked fan-out: the whole registry at once would be 40 concurrent
-    // subprocesses, and GitHub starts pushing back well before that helps
-    let mut per_site: Vec<(String, Vec<Alert>)> = Vec::new();
+    // subprocesses, and GitHub starts pushing back well before that helps.
+    // Alerts and the deploy head share a thread, so this is one pass, not two.
+    type Scan = (String, Result<Vec<Alert>, String>, Option<Deploy>);
+    let mut scans: Vec<Scan> = Vec::new();
     for chunk in sites.chunks(FANOUT) {
         let handles: Vec<_> = chunk
             .iter()
             .map(|(owner, repo)| {
                 let (owner, repo) = (owner.clone(), repo.clone());
                 std::thread::spawn(move || {
-                    let got = repo_alerts(&owner, &repo);
-                    (repo, got)
+                    let alerts = repo_alerts(&owner, &repo);
+                    let deploy = repo_deploy(&owner, &repo);
+                    (repo, alerts, deploy)
                 })
             })
             .collect();
         for h in handles {
-            let Ok((repo, got)) = h.join() else { continue };
-            match got {
-                Ok(alerts) => per_site.push((repo, alerts)),
-                // one unreadable repo shouldn't blank the panel; keep the last
-                // error as a footnote and carry on
-                Err(e) => st.error = Some(truncate_chars(&e, 110)),
+            if let Ok(s) = h.join() {
+                scans.push(s);
             }
         }
     }
 
     let mut rollups: HashMap<String, CveRollup> = HashMap::new();
-    let mut seen_site: HashMap<String, Vec<String>> = HashMap::new();
-    for (repo, alerts) in &per_site {
-        let (mut crit, mut high) = (0, 0);
-        for a in alerts {
-            if a.severity == "critical" {
-                crit += 1;
-            } else {
-                high += 1;
+    let mut cve_sites: HashMap<String, Vec<String>> = HashMap::new();
+    let mut eco_alerts: HashMap<String, usize> = HashMap::new();
+    for (repo, alerts, deploy) in &scans {
+        if let Some(d) = deploy {
+            st.deploys.push(d.clone());
+        }
+        let alerts = match alerts {
+            Ok(a) => a,
+            // a repo the registry knows and GitHub does not is drift, not a
+            // failure; anything else (auth, rate limit) is worth showing
+            Err(e) => {
+                if e.contains("404") || e.contains("Not Found") {
+                    st.unreadable += 1;
+                } else {
+                    st.error = Some(truncate_chars(e, 110));
+                }
+                continue;
             }
+        };
+        let mut per_eco: HashMap<&str, (usize, usize)> = HashMap::new();
+        for a in alerts {
+            let e = per_eco.entry(a.ecosystem.as_str()).or_insert((0, 0));
+            if a.severity == "critical" {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+            *eco_alerts.entry(a.ecosystem.clone()).or_insert(0) += 1;
+
             let r = rollups.entry(a.id.clone()).or_insert_with(|| CveRollup {
                 id: a.id.clone(),
                 severity: a.severity.clone(),
@@ -208,17 +334,20 @@ pub fn fetch() -> CveState {
             });
             r.cvss = r.cvss.max(a.cvss);
             r.oldest_ms = r.oldest_ms.min(a.created_ms);
-            seen_site.entry(a.id.clone()).or_default().push(repo.clone());
+            cve_sites.entry(a.id.clone()).or_default().push(repo.clone());
         }
-        st.total += crit + high;
-        st.critical += crit;
-        if crit + high > 0 {
-            st.sites_affected += 1;
-            st.by_site.push(SiteTally { repo: repo.clone(), critical: crit, high });
+        for (eco, (critical, high)) in per_eco {
+            st.site_eco.push(SiteEco {
+                repo: repo.clone(),
+                ecosystem: eco.to_string(),
+                critical,
+                high,
+            });
         }
     }
+
     // a CVE hitting the same site through two manifests is still one site
-    for (id, mut repos) in seen_site {
+    for (id, mut repos) in cve_sites {
         repos.sort();
         repos.dedup();
         if let Some(r) = rollups.get_mut(&id) {
@@ -226,7 +355,6 @@ pub fn fetch() -> CveState {
         }
     }
 
-    st.distinct = rollups.len();
     let mut worst: Vec<CveRollup> = rollups.into_values().collect();
     // critical first, then blast radius, then score: what to fix once to fix
     // it everywhere
@@ -238,16 +366,14 @@ pub fn fetch() -> CveState {
             .then(b.cvss.total_cmp(&a.cvss))
             .then(a.oldest_ms.cmp(&b.oldest_ms))
     });
-    worst.truncate(KEEP_CVES);
-    st.worst = worst;
+    st.rollups = worst;
 
-    st.by_site.sort_by(|a, b| {
-        b.critical
-            .cmp(&a.critical)
-            .then(b.high.cmp(&a.high))
-            .then(a.repo.cmp(&b.repo))
-    });
-    st.by_site.truncate(KEEP_SITES);
+    let mut ecos: Vec<(String, usize)> = eco_alerts.into_iter().collect();
+    ecos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    st.ecosystems = ecos.into_iter().map(|(e, _)| e).collect();
+
+    st.deploys.sort_by_key(|d| -d.when_ms);
+    st.deploys.truncate(KEEP_DEPLOYS);
     st.fetched_at_ms = now_ms();
     st
 }

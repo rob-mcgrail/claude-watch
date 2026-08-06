@@ -25,6 +25,7 @@ pub fn pane_label(p: PaneId) -> &'static str {
         PaneId::Overview => "sessions",
         PaneId::GitHub => "github",
         PaneId::Cve => "security",
+        PaneId::Sites => "sites",
     }
 }
 
@@ -142,6 +143,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         0 => render_overview(f, app, rows[0], accent),
         7 => render_github(f, app, rows[0], accent),
         8 => render_cve(f, app, rows[0], accent),
+        9 => render_sites(f, app, rows[0], accent),
         2 => layout_ops(f, app, rows[0], accent),
         3 => render_feed(f, app, rows[0], accent),
         4 => render_toolio(f, app, rows[0], accent),
@@ -1439,8 +1441,9 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
 
-/// Dependabot across the sites registry. Rolled up per advisory rather than
-/// listed per alert: the same CVE in fourteen sites is one fix, not fourteen.
+/// Dependabot across the sites registry, plus what has actually shipped.
+/// Rolled up per advisory rather than listed per alert: the same CVE in
+/// fourteen sites is one fix, not fourteen.
 fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::Cve, rect));
     let h = inner_h(rect);
@@ -1452,11 +1455,13 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         ))
     };
     let c = &app.cve;
+    let eco = app.cve_eco;
+    let view = c.filtered(eco, crate::cve::KEEP_CVES, crate::cve::KEEP_SITES);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if c.fetching && c.fetched_at_ms == 0 {
         lines.push(Line::from(Span::styled(
-            format!("⋯ scanning {} managed sites…", c.sites_scanned.max(40)),
+            "⋯ scanning the managed sites…".to_string(),
             Style::default().fg(Color::Yellow),
         )));
     }
@@ -1469,32 +1474,55 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     if c.fetched_at_ms > 0 {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {} critical", c.critical),
+                format!("  {} critical", view.critical),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" · {} high", c.total.saturating_sub(c.critical)),
+                format!(" · {} high", view.total.saturating_sub(view.critical)),
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(
                 format!(
                     " · {} distinct CVEs · {}/{} sites affected",
-                    c.distinct, c.sites_affected, c.sites_scanned
+                    view.distinct, view.sites_affected, c.sites_scanned
                 ),
                 Style::default().fg(Color::Gray),
             ),
+            Span::styled(
+                if c.unreadable > 0 {
+                    format!(" · {} not on github", c.unreadable)
+                } else {
+                    String::new()
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
+        // the filter is a mode, so it says so even when set to everything
+        let mut chips: Vec<Span> = vec![Span::styled(
+            "  <> ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+        for i in 0..c.eco_count() {
+            let st = if i == eco {
+                Style::default().fg(Color::Black).bg(Color::LightBlue).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            chips.push(Span::styled(format!(" {} ", c.eco_label(i)), st));
+            chips.push(Span::raw(" "));
+        }
+        lines.push(Line::from(chips));
     }
     lines.push(Line::default());
 
     lines.push(hdr("── worst CVEs · critical first, then blast radius ──"));
-    if c.worst.is_empty() && c.fetched_at_ms > 0 {
+    if view.worst.is_empty() && c.fetched_at_ms > 0 {
         lines.push(Line::from(Span::styled(
             "  · none".to_string(),
             Style::default().fg(Color::DarkGray),
         )));
     }
-    for r in &c.worst {
+    for r in &view.worst {
         let (mark, st) = if r.severity == "critical" {
             ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
         } else {
@@ -1507,6 +1535,12 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         } else {
             "   —".to_string()
         };
+        // the ecosystem is redundant once you have filtered to one
+        let pkg = if eco == 0 {
+            format!("{} ({})", r.package, r.ecosystem)
+        } else {
+            r.package.clone()
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("  {mark} "), st),
             Span::styled(
@@ -1515,7 +1549,7 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
             ),
             Span::styled(format!(" {score} "), Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:<22}", truncate_chars(&r.package, 22)),
+                format!("{:<28}", truncate_chars(&pkg, 28)),
                 Style::default().fg(Color::LightCyan),
             ),
             Span::styled(
@@ -1531,19 +1565,42 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     lines.push(Line::default());
 
     lines.push(hdr("── worst sites ──"));
-    for s in &c.by_site {
+    for (repo, crit, high) in &view.by_site {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<26}", truncate_chars(&s.repo, 26)),
+                format!("  {:<26}", truncate_chars(repo, 26)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{crit:>4} critical"), Style::default().fg(Color::Red)),
+            Span::styled(format!(" · {high:>4} high"), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    lines.push(Line::default());
+
+    lines.push(hdr("── deploy-production · most recent ──"));
+    if c.deploys.is_empty() && c.fetched_at_ms > 0 {
+        lines.push(Line::from(Span::styled(
+            "  · none".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for d in &c.deploys {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<26}", truncate_chars(&d.repo, 26)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:>4} critical", s.critical),
-                Style::default().fg(Color::Red),
+                format!("{:>9} ago", fmt_dur(now - d.when_ms)),
+                Style::default().fg(Color::Green),
             ),
             Span::styled(
-                format!(" · {:>4} high", s.high),
-                Style::default().fg(Color::Yellow),
+                format!(" · {:<16}", truncate_chars(&d.author, 16)),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!(" {}", truncate_chars(&d.subject, 58)),
+                Style::default().fg(Color::DarkGray),
             ),
         ]));
     }
@@ -1557,12 +1614,135 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     let total = lines.len();
     let (start, end) = window(app, PaneId::Cve, total, h);
     let visible = lines[start..end].to_vec();
+    let filt = app.cve.eco_label(app.cve_eco);
     let block = pane_block(
         app,
         PaneId::Cve,
-        format!("security · dependabot · managed sites · {updated}"),
+        format!("security · managed sites · {filt} · {updated}"),
         accent,
     );
+    f.render_widget(Paragraph::new(visible).block(block), rect);
+}
+
+/// The sites registry as a patching work queue: stalest first, with the facts
+/// that decide whether a stale site is urgent — runtime EOL, SLA, tests.
+fn render_sites(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
+    app.pane_rects.push((PaneId::Sites, rect));
+    let h = inner_h(rect);
+    let now = now_ms();
+    let st = &app.sites_reg;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if let Some(e) = &st.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {}", truncate_chars(e, 110)),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if st.fetching && st.fetched_at_ms == 0 {
+        lines.push(Line::from(Span::styled(
+            "⋯ reading the sites registry…".to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if st.fetched_at_ms > 0 {
+        let sla = st.rows.iter().filter(|r| r.sla).count();
+        let stale = st
+            .rows
+            .iter()
+            .filter(|r| r.last_patched_ms.map(|t| now - t > 90 * 86_400_000).unwrap_or(true))
+            .count();
+        let eol = st
+            .rows
+            .iter()
+            .filter(|r| r.eol_ms.map(|t| t < now).unwrap_or(false))
+            .count();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} sites", st.rows.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · {sla} under proactive SLA"), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(" · {stale} unpatched 90d+"),
+                Style::default().fg(if stale > 0 { Color::Yellow } else { Color::Gray }),
+            ),
+            Span::styled(
+                format!(" · {eol} past runtime EOL"),
+                Style::default().fg(if eol > 0 { Color::Red } else { Color::Gray }),
+            ),
+        ]));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "── sites · least recently patched first ──".to_string(),
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    for r in &st.rows {
+        // the age is the whole point of the ordering, so it leads and it is
+        // coloured by how bad it is
+        let (patched, pstyle) = match r.last_patched_ms {
+            None => ("never".to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Some(t) => {
+                let d = now - t;
+                let style = if d > 180 * 86_400_000 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if d > 90 * 86_400_000 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                (fmt_dur(d), style)
+            }
+        };
+        let eol = match r.eol_ms {
+            Some(t) if t < now => (" EOL".to_string(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Some(t) if t - now < 180 * 86_400_000 => (
+                format!(" eol {}", fmt_dur(t - now)),
+                Style::default().fg(Color::Yellow),
+            ),
+            _ => (String::new(), Style::default().fg(Color::DarkGray)),
+        };
+        let mut flags = String::new();
+        if r.sla {
+            flags.push_str(" sla");
+        }
+        if !r.has_tests {
+            flags.push_str(" no-tests");
+        }
+        if r.internal {
+            flags.push_str(" internal");
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<26}", truncate_chars(&r.repo, 26)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{patched:>9}"), pstyle),
+            Span::styled(
+                format!("  {:<18}", truncate_chars(&r.stack, 18)),
+                Style::default().fg(Color::LightCyan),
+            ),
+            Span::styled(
+                format!("{:<14}", truncate_chars(&r.runtime, 14)),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(format!("{:<10}", eol.0), eol.1),
+            Span::styled(flags, Style::default().fg(Color::Magenta)),
+        ]));
+    }
+
+    let updated = match (st.fetching, st.fetched_at_ms) {
+        (true, 0) => "reading…".to_string(),
+        (true, at) => format!("read {} ago · reloading…", fmt_dur(now - at)),
+        (false, 0) => String::new(),
+        (false, at) => format!("read {} ago", fmt_dur(now - at)),
+    };
+    let total = lines.len();
+    let (start, end) = window(app, PaneId::Sites, total, h);
+    let visible = lines[start..end].to_vec();
+    let block = pane_block(app, PaneId::Sites, format!("sites registry · {updated}"), accent);
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
 

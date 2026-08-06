@@ -4,6 +4,7 @@ mod gcache;
 mod gh;
 mod cve;
 mod haunt;
+mod sitelist;
 mod overview;
 mod price;
 mod ui;
@@ -74,7 +75,7 @@ fn main() -> io::Result<()> {
                      usage: claude-watch [--nzd-rate N] [--context-window N] [--session ID-PREFIX]\n\
                                         [--dump] [--overview] [--version]\n\n\
                      keys: 0 sessions machine-wide · 1-6 views (1 main · 2 ops · 3 activity · 4 tool i/o\n\
-                           · 5 context · 6 memory) · g github + haunt · space 10-day digest · v CVEs\n\
+                           · 5 context · 6 memory) · g github+haunt · space digest · s security · m sites\n\
                            tab/shift-tab sessions · </> agent filter (narrative, activity, tool i/o)\n\
                            / search focused pane · n/N matches · arrows/pgup/pgdn scroll\n\
                            mouse: wheel scrolls pane under cursor, click focuses · q quit"
@@ -99,6 +100,8 @@ fn main() -> io::Result<()> {
     // warm both g-view modes in the background so either is populated on
     // first visit and switching between them costs nothing
     app.gh_boot();
+    app.cve_boot();
+    app.sites_boot();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -238,11 +241,25 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             app.refresh_overview();
         }
         KeyCode::Char('g') => app.gh_open(GhMode::Live),
-        KeyCode::Char('v') => app.cve_open(),
+        KeyCode::Char('s') => app.cve_open(),
+        KeyCode::Char('m') => app.sites_open(),
         // space is a toggle: into the digest, then back where you came from
         KeyCode::Char(' ') => app.gh_toggle_digest(),
-        KeyCode::Char('<') | KeyCode::Char(',') => app.cycle_think_filter(-1),
-        KeyCode::Char('>') | KeyCode::Char('.') => app.cycle_think_filter(1),
+        // on the security view these cycle the ecosystem filter instead
+        KeyCode::Char('<') | KeyCode::Char(',') => {
+            if app.layout == 8 {
+                app.cycle_cve_eco(-1)
+            } else {
+                app.cycle_think_filter(-1)
+            }
+        }
+        KeyCode::Char('>') | KeyCode::Char('.') => {
+            if app.layout == 8 {
+                app.cycle_cve_eco(1)
+            } else {
+                app.cycle_think_filter(1)
+            }
+        }
         KeyCode::Char('/') => {
             let searchable = matches!(
                 app.focus,

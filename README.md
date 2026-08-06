@@ -36,7 +36,9 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 
 `Space` is a round trip: press it to peek at the digest, press it again to drop back into whatever view you came from. Both modes are warmed on startup and the one you are not looking at is kept warm while the pane is open, so switching either way renders instantly from data already in hand — never a reload. Anything still in flight sorts to the top of its section. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
 
-`v` **security** — every open critical and high Dependabot alert across the sites registry, rolled up per advisory. The org-wide endpoint returns 17,000+ alerts, most of them against throwaway repos, so the scope is `sites list` — the 40 sites Haunt actually maintains. Ranked critical first, then by blast radius: the same CVE in fourteen sites is one row and one fix, not fourteen. A second section tallies the worst sites. A full scan is ~14 seconds across 40 repos, cached for 30 minutes and shared between instances, so it only runs once no matter how many watchers are open.
+`s` **security** — every open critical and high Dependabot alert across the sites registry, rolled up per advisory. The org-wide endpoint returns 17,000+ alerts, most of them against throwaway repos, so the scope is `sites list` — the 40 sites Haunt actually maintains. Ranked critical first, then by blast radius: the same CVE in fourteen sites is one row and one fix, not fourteen. `<` and `>` filter by ecosystem (all / npm / composer / rubygems — built from whatever the scan finds). Below that, the worst sites by critical count, and the most recent pushes to each site's `deploy-production` branch. A full scan is ~15 seconds across 40 repos; it is preloaded at startup, cached for 30 minutes and shared between instances, and pressing `s` again while it is showing forces a rescan.
+
+`m` **sites** — the registry as a patching work queue: least recently patched first, with the facts that decide whether a stale site is urgent — stack and runtime versions, runtime EOL (flagged red once passed), proactive SLA, and whether it has tests. Same contract as `s`: preloaded, cached, and `m` again reloads it.
 
 `1` **main** (above) — narrative pane, reads/writes/hooks/skills rail, full-width activity feed.
 
@@ -75,7 +77,8 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 |-----|--------|
 | `0`–`6`, `g` | switch view (`0` sessions machine-wide, `g` github + haunt live) |
 | `Space` | peek at the github + haunt 10-day digest; press again to go back |
-| `v` | security: open critical/high CVEs across the managed sites |
+| `s` | security: open critical/high CVEs across the managed sites (`<`/`>` filter by ecosystem) |
+| `m` | sites registry, least recently patched first |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
 | `↑` `↓` `Enter` | on view `0`: select a session and open it |
 | `<` / `>` | agent filter: all → main → each subagent (applies to narrative, activity, and tool i/o) |
