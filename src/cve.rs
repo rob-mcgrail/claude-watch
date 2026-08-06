@@ -17,8 +17,62 @@ pub struct CveRollup {
     pub cvss: f64,
     pub package: String,
     pub ecosystem: String,
+    /// Affected site count per filter key. One CVE can span both npm buckets —
+    /// minimist turns up in a Next app and in a SilverStripe theme build — so
+    /// the blast radius is per bucket, not a single number.
+    pub sites_by_key: Vec<(String, usize)>,
+    pub oldest_ms: i64,
+}
+
+/// A rollup resolved against the current filter.
+#[derive(Clone)]
+pub struct CveRow {
+    pub id: String,
+    pub severity: String,
+    pub cvss: f64,
+    pub package: String,
+    pub ecosystem: String,
     pub sites: usize,
     pub oldest_ms: i64,
+}
+
+/// npm means two very different things across this estate: the runtime of a
+/// Next/Bun app, or just the webpack/gulp toolchain that precompiles assets for
+/// a Rails or SilverStripe site. A CVE in the first is served to users; in the
+/// second it never leaves the build. `runtime_versions` in the registry is what
+/// separates them, and the manifest paths agree — the build-only sites carry
+/// their lockfiles under themes/ and app/cms/javascript/.
+pub const NPM_SERVED: &str = "npm · served";
+pub const NPM_BUILD: &str = "npm · toolchain";
+/// A Gemfile on a site that does not run Ruby is there to deploy it —
+/// Capistrano and its dependency tree. Worth fixing; not worth alarming about.
+pub const CAP: &str = "cap";
+
+/// The rule of thumb: **an npm tree living inside a Ruby or PHP app directory
+/// is that app's asset pipeline.** A CVE there is webpack/gulp build machinery;
+/// a CVE in a standalone package.json is a Next or Bun app serving users.
+///
+/// It resolves the monorepos without a special case. `consumer` has npm at
+/// `mms/` and `replatform/`, and a Gemfile at `mms/` — so mms is the Rails
+/// theme build and replatform is the react-router app. `powerswitch` has
+/// `gilbert/app/client` under `gilbert/Gemfile.lock`, and `romeo/` standing
+/// alone with next in it. Same rule, both right, and no extra API calls: those
+/// composer and rubygems manifest paths arrive with the alerts.
+///
+/// `roots` are the app directories; "" means the whole repo is one app, which
+/// is the ordinary case for a SilverStripe or Rails site.
+fn npm_is_toolchain(manifest_dir: &str, roots: &[String]) -> bool {
+    roots.iter().any(|r| {
+        r.is_empty() || manifest_dir == r || manifest_dir.starts_with(&format!("{r}/"))
+    })
+}
+
+/// Directory part of `themes/x/package-lock.json`, or "" at the repo root.
+fn dir_of(path: &str) -> String {
+    match path.rfind('/') {
+        Some(i) => path[..i].to_string(),
+        None => String::new(),
+    }
 }
 
 /// Counts per (site, ecosystem) rather than per site, so the ecosystem filter
@@ -66,7 +120,7 @@ pub struct CveState {
 
 /// What the panel shows for one ecosystem selection.
 pub struct Filtered {
-    pub worst: Vec<CveRollup>,
+    pub worst: Vec<CveRow>,
     pub by_site: Vec<(String, usize, usize)>,
     pub total: usize,
     pub critical: usize,
@@ -94,8 +148,33 @@ impl CveState {
         let eco = (idx > 0).then(|| self.eco_label(idx));
         let keep = |e: &str| eco.as_deref().map(|f| f == e).unwrap_or(true);
 
-        let mut worst: Vec<CveRollup> =
-            self.rollups.iter().filter(|r| keep(&r.ecosystem)).cloned().collect();
+        // the blast radius depends on the filter, so the ranking has to be
+        // recomputed with it rather than reused from the scan
+        let mut worst: Vec<CveRow> = self
+            .rollups
+            .iter()
+            .filter_map(|r| {
+                let sites: usize =
+                    r.sites_by_key.iter().filter(|(k, _)| keep(k)).map(|(_, n)| n).sum();
+                (sites > 0).then(|| CveRow {
+                    id: r.id.clone(),
+                    severity: r.severity.clone(),
+                    cvss: r.cvss,
+                    package: r.package.clone(),
+                    ecosystem: r.ecosystem.clone(),
+                    sites,
+                    oldest_ms: r.oldest_ms,
+                })
+            })
+            .collect();
+        worst.sort_by(|a, b| {
+            let rank = |s: &str| if s == "critical" { 0 } else { 1 };
+            rank(&a.severity)
+                .cmp(&rank(&b.severity))
+                .then(b.sites.cmp(&a.sites))
+                .then(b.cvss.total_cmp(&a.cvss))
+                .then(a.oldest_ms.cmp(&b.oldest_ms))
+        });
         let distinct = worst.len();
         worst.truncate(keep_cves);
 
@@ -132,6 +211,13 @@ const KEEP_DEPLOYS: usize = 12;
 /// only trades memory for GitHub's secondary rate limiter.
 const FANOUT: usize = 8;
 
+fn strs(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 fn parse_flex_ms(t: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(t)
         .map(|d| d.timestamp_millis())
@@ -147,9 +233,16 @@ fn owner_of(repo_url: &str) -> Option<String> {
     after_host.split('/').next().map(str::to_string)
 }
 
-/// The managed sites, as (owner, repo). Anything not in this registry is a
-/// throwaway as far as this panel is concerned.
-fn registry() -> Result<Vec<(String, String)>, String> {
+pub struct Site {
+    pub owner: String,
+    pub repo: String,
+    /// Runs PHP or Ruby in production, so an npm tree here may be a build step.
+    pub server_side: bool,
+}
+
+/// The managed sites. Anything not in this registry is a throwaway as far as
+/// this panel is concerned.
+fn registry() -> Result<Vec<Site>, String> {
     let out = Command::new("sites")
         .args(["list", "--json"])
         .output()
@@ -171,7 +264,13 @@ fn registry() -> Result<Vec<(String, String)>, String> {
                 .and_then(|x| x.as_str())
                 .and_then(owner_of)
                 .unwrap_or_else(|| "haunt-digital".to_string());
-            Some((owner, repo))
+            let starts = |xs: &[String], ps: &[&str]| {
+                xs.iter().any(|v| ps.iter().any(|p| v.starts_with(p)))
+            };
+            // stack_tags is the fallback for sites with no recorded versions
+            let server_side = starts(&strs(s, "runtime_versions"), &["php", "ruby", "python"])
+                || starts(&strs(s, "stack_tags"), &["php", "silverstripe", "rails", "ruby"]);
+            Some(Site { owner, repo, server_side })
         })
         .collect())
 }
@@ -184,7 +283,8 @@ const JQ_ALERTS: &str = ".[] | [\
     (.security_advisory.cve_id // .security_advisory.ghsa_id), \
     .dependency.package.ecosystem, \
     .dependency.package.name, \
-    .created_at\
+    .created_at, \
+    (.dependency.manifest_path // \"\")\
     ] | @tsv";
 
 const JQ_BRANCH: &str = "[.commit.commit.committer.date, \
@@ -198,6 +298,7 @@ struct Alert {
     ecosystem: String,
     package: String,
     created_ms: i64,
+    manifest_path: String,
 }
 
 fn gh_lines(args: &[&str]) -> Result<Vec<String>, String> {
@@ -234,6 +335,7 @@ fn repo_alerts(owner: &str, repo: &str) -> Result<Vec<Alert>, String> {
                 ecosystem: f[3].to_string(),
                 package: f[4].to_string(),
                 created_ms: parse_flex_ms(f[5]),
+                manifest_path: f.get(6).unwrap_or(&"").to_string(),
             })
         })
         .collect())
@@ -272,17 +374,18 @@ pub fn fetch() -> CveState {
     // chunked fan-out: the whole registry at once would be 40 concurrent
     // subprocesses, and GitHub starts pushing back well before that helps.
     // Alerts and the deploy head share a thread, so this is one pass, not two.
-    type Scan = (String, Result<Vec<Alert>, String>, Option<Deploy>);
+    type Scan = (String, bool, Result<Vec<Alert>, String>, Option<Deploy>);
     let mut scans: Vec<Scan> = Vec::new();
     for chunk in sites.chunks(FANOUT) {
         let handles: Vec<_> = chunk
             .iter()
-            .map(|(owner, repo)| {
-                let (owner, repo) = (owner.clone(), repo.clone());
+            .map(|site| {
+                let (owner, repo, server_side) =
+                    (site.owner.clone(), site.repo.clone(), site.server_side);
                 std::thread::spawn(move || {
                     let alerts = repo_alerts(&owner, &repo);
                     let deploy = repo_deploy(&owner, &repo);
-                    (repo, alerts, deploy)
+                    (repo, server_side, alerts, deploy)
                 })
             })
             .collect();
@@ -294,9 +397,11 @@ pub fn fetch() -> CveState {
     }
 
     let mut rollups: HashMap<String, CveRollup> = HashMap::new();
-    let mut cve_sites: HashMap<String, Vec<String>> = HashMap::new();
+    // (cve, filter key) -> sites, deduped: one CVE can reach a site through two
+    // manifests and that is still one site
+    let mut cve_sites: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut eco_alerts: HashMap<String, usize> = HashMap::new();
-    for (repo, alerts, deploy) in &scans {
+    for (repo, server_side, alerts, deploy) in &scans {
         if let Some(d) = deploy {
             st.deploys.push(d.clone());
         }
@@ -313,15 +418,53 @@ pub fn fetch() -> CveState {
                 continue;
             }
         };
-        let mut per_eco: HashMap<&str, (usize, usize)> = HashMap::new();
+        // where the Ruby/PHP apps live in this repo, from their own manifests.
+        // Only worth looking on a site the registry says actually runs one:
+        // a Next or Bun repo can carry a root Gemfile for deploy tooling, and
+        // that must not turn its whole npm tree into "build only".
+        let mut roots: Vec<String> = if *server_side {
+            alerts
+                .iter()
+                .filter(|a| matches!(a.ecosystem.as_str(), "composer" | "rubygems"))
+                .map(|a| dir_of(&a.manifest_path))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        roots.sort();
+        roots.dedup();
+        // an app in a subdirectory means the repo root is scaffolding, not a
+        // third app — otherwise a root deploy Gemfile would swallow the lot
+        if roots.len() > 1 {
+            roots.retain(|r| !r.is_empty());
+        }
+        // a server-side site with no located app is one app filling the repo —
+        // the ordinary single-app SilverStripe or Rails layout
+        if roots.is_empty() && *server_side {
+            roots.push(String::new());
+        }
+
+        let mut per_eco: HashMap<String, (usize, usize)> = HashMap::new();
         for a in alerts {
-            let e = per_eco.entry(a.ecosystem.as_str()).or_insert((0, 0));
+            let key = match a.ecosystem.as_str() {
+                "npm" => if npm_is_toolchain(&dir_of(&a.manifest_path), &roots) {
+                    NPM_BUILD
+                } else {
+                    NPM_SERVED
+                }
+                .to_string(),
+                // same rule the other way round: a Ruby or PHP manifest with no
+                // app around it is deploy tooling, not the application
+                "rubygems" | "composer" if !*server_side => CAP.to_string(),
+                e => e.to_string(),
+            };
+            let e = per_eco.entry(key.clone()).or_insert((0, 0));
             if a.severity == "critical" {
                 e.0 += 1;
             } else {
                 e.1 += 1;
             }
-            *eco_alerts.entry(a.ecosystem.clone()).or_insert(0) += 1;
+            *eco_alerts.entry(key.clone()).or_insert(0) += 1;
 
             let r = rollups.entry(a.id.clone()).or_insert_with(|| CveRollup {
                 id: a.id.clone(),
@@ -329,44 +472,35 @@ pub fn fetch() -> CveState {
                 cvss: a.cvss,
                 package: a.package.clone(),
                 ecosystem: a.ecosystem.clone(),
-                sites: 0,
+                sites_by_key: Vec::new(),
                 oldest_ms: a.created_ms,
             });
             r.cvss = r.cvss.max(a.cvss);
             r.oldest_ms = r.oldest_ms.min(a.created_ms);
-            cve_sites.entry(a.id.clone()).or_default().push(repo.clone());
+            cve_sites
+                .entry((a.id.clone(), key))
+                .or_default()
+                .push(repo.clone());
         }
         for (eco, (critical, high)) in per_eco {
             st.site_eco.push(SiteEco {
                 repo: repo.clone(),
-                ecosystem: eco.to_string(),
+                ecosystem: eco,
                 critical,
                 high,
             });
         }
     }
 
-    // a CVE hitting the same site through two manifests is still one site
-    for (id, mut repos) in cve_sites {
+    for ((id, key), mut repos) in cve_sites {
         repos.sort();
         repos.dedup();
         if let Some(r) = rollups.get_mut(&id) {
-            r.sites = repos.len();
+            r.sites_by_key.push((key, repos.len()));
         }
     }
-
-    let mut worst: Vec<CveRollup> = rollups.into_values().collect();
-    // critical first, then blast radius, then score: what to fix once to fix
-    // it everywhere
-    worst.sort_by(|a, b| {
-        let rank = |s: &str| if s == "critical" { 0 } else { 1 };
-        rank(&a.severity)
-            .cmp(&rank(&b.severity))
-            .then(b.sites.cmp(&a.sites))
-            .then(b.cvss.total_cmp(&a.cvss))
-            .then(a.oldest_ms.cmp(&b.oldest_ms))
-    });
-    st.rollups = worst;
+    // ranking depends on the active filter, so `filtered` does the sorting
+    st.rollups = rollups.into_values().collect();
 
     let mut ecos: Vec<(String, usize)> = eco_alerts.into_iter().collect();
     ecos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
