@@ -401,9 +401,20 @@ pub fn is_auth_err(e: &str) -> bool {
     e.contains("not authenticated")
 }
 
+/// A dashboard polling every few minutes has no business rewriting a shared
+/// binary on disk as a side effect. The `sites` CLI self-updates silently
+/// unless told not to, and an update landing mid-session swaps the tool —
+/// and, as seen, can leave the stored token being refused — under whoever is
+/// using it interactively. Our reads opt out; their own invocations still
+/// update it normally.
+fn sites_cmd(args: &[&str]) -> Command {
+    let mut c = Command::new("sites");
+    c.args(args).env("SITES_NO_AUTO_UPDATE", "1");
+    c
+}
+
 fn sites_json(args: &[&str]) -> Result<Value, String> {
-    let out = Command::new("sites")
-        .args(args)
+    let out = sites_cmd(args)
         .output()
         .map_err(|_| "sites: CLI not installed".to_string())?;
     if !out.status.success() {

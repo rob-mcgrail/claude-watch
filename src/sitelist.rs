@@ -58,7 +58,12 @@ fn opt_ms(v: &Value, key: &str) -> Option<i64> {
 /// background thread so a slow network never stalls a frame.
 pub fn fetch() -> SitesState {
     let mut st = SitesState::default();
-    let out = match Command::new("sites").args(["list", "--json"]).output() {
+    // never let a background poll trigger the CLI's silent self-update
+    let out = match Command::new("sites")
+        .args(["list", "--json"])
+        .env("SITES_NO_AUTO_UPDATE", "1")
+        .output()
+    {
         Ok(o) => o,
         Err(_) => {
             st.error = Some("sites: CLI not installed".to_string());
