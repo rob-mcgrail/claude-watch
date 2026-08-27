@@ -381,14 +381,39 @@ fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string()
 }
 
+/// The CLI's own wording, made short and actionable.
+///
+/// An expired token is the ordinary case rather than an exotic one: the `sites`
+/// binary self-updates silently, and a server deploy can outdate a session that
+/// was working ten minutes earlier. That reads as a thing to go and do, not as
+/// a failure of the scan, so it gets its own shape.
+pub fn sites_err(raw: &str) -> String {
+    let e = raw.trim();
+    if e.contains("Authentication failed") || e.contains("sites login") || e.contains("401") {
+        "sites: not authenticated — run `sites login`".to_string()
+    } else {
+        format!("sites: {}", truncate_chars(e.trim_start_matches("Error: "), 110))
+    }
+}
+
+/// Whether a message is the one the user can fix in one command.
+pub fn is_auth_err(e: &str) -> bool {
+    e.contains("not authenticated")
+}
+
 fn sites_json(args: &[&str]) -> Result<Value, String> {
     let out = Command::new("sites")
         .args(args)
         .output()
         .map_err(|_| "sites: CLI not installed".to_string())?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(truncate_chars(&err, 120));
+        return Err(sites_err(&String::from_utf8_lossy(&out.stderr)));
+    }
+    // an unauthenticated CLI has been seen to answer on stdout as well, and a
+    // parse error would bury the one message worth reading
+    let body = String::from_utf8_lossy(&out.stdout);
+    if body.trim_start().starts_with("Error:") {
+        return Err(sites_err(&body));
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("sites: bad json ({e})"))
 }

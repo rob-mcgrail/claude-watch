@@ -1485,6 +1485,18 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     let filters = app.cve_filters;
     let view = c.filtered(filters, crate::cve::KEEP_CVES, crate::cve::KEEP_SITES);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // "· none" under every heading reads as a clean bill of health. When the
+    // read failed outright we know nothing, which is not the same thing, so the
+    // empty states stay quiet and the error carries the message alone.
+    let known = c.error.is_none() || !c.advisories.is_empty();
+    let empty = |lines: &mut Vec<Line<'static>>| {
+        if known {
+            lines.push(Line::from(Span::styled(
+                "  · none".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    };
 
     if c.fetching && c.fetched_at_ms == 0 {
         lines.push(Line::from(Span::styled(
@@ -1493,10 +1505,23 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         )));
     }
     if let Some(e) = &c.error {
+        // a token the user can renew in one command is not the same kind of
+        // news as a scan that fell over, and should not wear the same colour
+        let auth = crate::cve::is_auth_err(e);
         lines.push(Line::from(Span::styled(
-            format!("  ⚠ {}", truncate_chars(e, 110)),
-            Style::default().fg(Color::Red),
+            format!("  {} {}", if auth { "→" } else { "⚠" }, truncate_chars(e, 110)),
+            if auth {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Red)
+            },
         )));
+        if auth {
+            lines.push(Line::from(Span::styled(
+                "    the CLI self-updates, so a server deploy can outdate a session that worked minutes ago".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
     // the registry failing to reach GitHub is different from us failing to
     // reach the registry: the numbers are still real, just older than claimed
@@ -1507,7 +1532,7 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
         )));
     }
 
-    if c.fetched_at_ms > 0 {
+    if c.fetched_at_ms > 0 && known {
         let mut head = vec![
             Span::styled(
                 format!("  {} critical", view.sev_counts[0]),
@@ -1606,7 +1631,7 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     // and each one is a decision someone has to make today
     lines.push(hdr("── critical ──"));
     if view.critical.is_empty() && c.fetched_at_ms > 0 {
-        lines.push(Line::from(Span::styled("  · none".to_string(), dim)));
+        empty(&mut lines);
     }
     for r in &view.critical {
         let (e_txt, e_st) = epss(r.epss);
@@ -1705,7 +1730,7 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
 
     lines.push(hdr("── worst · severity, then exploit probability, then blast radius ──"));
     if view.worst.is_empty() && c.fetched_at_ms > 0 {
-        lines.push(Line::from(Span::styled("  · none".to_string(), dim)));
+        empty(&mut lines);
     }
     for r in &view.worst {
         let (e_txt, e_st) = epss(r.epss);
@@ -1746,7 +1771,7 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
 
     lines.push(hdr("── worst sites ──"));
     if view.by_site.is_empty() && c.fetched_at_ms > 0 {
-        lines.push(Line::from(Span::styled("  · none".to_string(), dim)));
+        empty(&mut lines);
     }
     for t in &view.by_site {
         let mut sp = vec![
@@ -1838,9 +1863,14 @@ fn render_sites(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if let Some(e) = &st.error {
+        let auth = crate::cve::is_auth_err(e);
         lines.push(Line::from(Span::styled(
-            format!("  ⚠ {}", truncate_chars(e, 110)),
-            Style::default().fg(Color::Red),
+            format!("  {} {}", if auth { "→" } else { "⚠" }, truncate_chars(e, 110)),
+            if auth {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Red)
+            },
         )));
     }
     if st.fetching && st.fetched_at_ms == 0 {

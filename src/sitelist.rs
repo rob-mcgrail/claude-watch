@@ -3,7 +3,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::app::{now_ms, truncate_chars};
+use crate::app::now_ms;
 
 /// One row of the sites registry, flattened to what the panel shows.
 #[derive(Clone, Serialize, Deserialize)]
@@ -66,8 +66,7 @@ pub fn fetch() -> SitesState {
         }
     };
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        st.error = Some(truncate_chars(&err, 120));
+        st.error = Some(crate::cve::sites_err(&String::from_utf8_lossy(&out.stderr)));
         return st;
     }
     let v: Value = match serde_json::from_slice(&out.stdout) {
