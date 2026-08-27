@@ -245,21 +245,25 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         KeyCode::Char('m') => app.sites_open(),
         // space toggles the g view's mode; it does not open the view
         KeyCode::Char(' ') => app.gh_toggle_digest(),
-        // on the security view these cycle the ecosystem filter instead
+        // on the security view these cycle the tier filter instead
         KeyCode::Char('<') | KeyCode::Char(',') => {
             if app.layout == 8 {
-                app.cycle_cve_eco(-1)
+                app.cycle_cve_tier(-1)
             } else {
                 app.cycle_think_filter(-1)
             }
         }
         KeyCode::Char('>') | KeyCode::Char('.') => {
             if app.layout == 8 {
-                app.cycle_cve_eco(1)
+                app.cycle_cve_tier(1)
             } else {
                 app.cycle_think_filter(1)
             }
         }
+        // the security view's other three filters
+        KeyCode::Char('e') if app.layout == 8 => app.cycle_cve_eco(1),
+        KeyCode::Char('x') if app.layout == 8 => app.cycle_cve_sev(),
+        KeyCode::Char('f') if app.layout == 8 => app.toggle_cve_fixable(),
         KeyCode::Char('/') => {
             let searchable = matches!(
                 app.focus,

@@ -431,13 +431,18 @@ pub struct App {
 
     // github + haunt activity (view g / space)
     pub gh_mode: GhMode,
-    // dependabot across the managed sites (view v)
+    // dependabot across the managed sites (view s)
     pub cve: crate::cve::CveState,
     cve_tx: Sender<crate::cve::CveState>,
     cve_rx: Receiver<crate::cve::CveState>,
     cve_attempt: Option<Instant>,
-    /// 0 = every ecosystem, then one per entry in `cve.ecosystems`.
-    pub cve_eco: usize,
+    pub cve_filters: crate::cve::Filters,
+    /// What has shipped — GitHub's answer, on its own slower clock so the
+    /// advisories never wait for it.
+    pub deploys: crate::cve::DeployState,
+    dep_tx: Sender<crate::cve::DeployState>,
+    dep_rx: Receiver<crate::cve::DeployState>,
+    dep_attempt: Option<Instant>,
     // sites registry (view m)
     pub sites_reg: crate::sitelist::SitesState,
     sites_tx: Sender<crate::sitelist::SitesState>,
@@ -542,6 +547,7 @@ impl App {
         let hooks_config = load_hook_config(&cwd);
         let (gh_tx, gh_rx) = std::sync::mpsc::channel();
         let (cve_tx, cve_rx) = std::sync::mpsc::channel();
+        let (dep_tx, dep_rx) = std::sync::mpsc::channel();
         let (sites_tx, sites_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             cwd,
@@ -608,7 +614,11 @@ impl App {
             cve_tx,
             cve_rx,
             cve_attempt: None,
-            cve_eco: 0,
+            cve_filters: Default::default(),
+            deploys: Default::default(),
+            dep_tx,
+            dep_rx,
+            dep_attempt: None,
             sites_reg: Default::default(),
             sites_tx,
             sites_rx,
@@ -773,23 +783,32 @@ impl App {
             self.apply_gh(msg);
         }
         while let Ok(st) = self.cve_rx.try_recv() {
-            // an empty result means another instance held the scan lock —
+            // an empty result means another instance held the read lock —
             // clear the spinner but keep whatever is already on screen
             if st.fetched_at_ms > 0 {
                 self.cve = st;
                 // content just grew from nothing; re-pin to the top so the
                 // summary is not left scrolled off
                 self.scroll.insert(PaneId::Cve, usize::MAX);
-                // a rescan can drop an ecosystem entirely
-                if self.cve_eco >= self.cve.eco_count() {
-                    self.cve_eco = 0;
-                }
+                self.clamp_cve_filters();
             } else {
                 self.cve.fetching = false;
             }
         }
-        if self.layout == 8 && self.cve_stale() {
-            self.cve_refresh();
+        while let Ok(st) = self.dep_rx.try_recv() {
+            if st.fetched_at_ms > 0 {
+                self.deploys = st;
+            } else {
+                self.deploys.fetching = false;
+            }
+        }
+        if self.layout == 8 {
+            if self.cve_stale() {
+                self.cve_refresh();
+            }
+            if self.dep_stale() {
+                self.dep_refresh();
+            }
         }
         while let Ok(st) = self.sites_rx.try_recv() {
             let keep_err = st.error.clone();
@@ -1900,13 +1919,16 @@ impl App {
         });
     }
 
-    /// Warm the security scan at startup too, so the first `s` is instant. It
-    /// is the slowest of the three fetches, hence its own thread rather than a
-    /// place in the g-view chain.
+    /// Warm the security view at startup so the first `s` is instant. The
+    /// advisories are one fast registry read now; the deploy heads are the slow
+    /// half, so they get their own thread and their own clock.
     pub fn cve_boot(&mut self) {
         self.load_ccache();
         if self.cve_stale() {
             self.cve_refresh();
+        }
+        if self.dep_stale() {
+            self.dep_refresh();
         }
     }
 
@@ -1937,20 +1959,34 @@ impl App {
 
     // ---------- view v: dependabot across the managed sites ----------
 
-    /// Open the security view, showing whatever is cached while any rescan runs
-    /// behind it. A full scan is ~8s, so it must never be in the way.
+    /// Open the security view, showing whatever is cached while any reload runs
+    /// behind it.
     pub fn cve_open(&mut self) {
-        // pressing s on the view already showing means "rescan now"
-        let rescan = self.layout == 8;
+        // pressing s on the view already showing means "reload now"
+        let reload = self.layout == 8;
         self.layout = 8;
         self.focus = PaneId::Cve;
         // a report reads from the top, unlike the feeds this offset convention
         // was built for; the render clamps this to "as far up as it goes"
         self.scroll.insert(PaneId::Cve, usize::MAX);
         self.load_ccache();
-        if rescan || self.cve_stale() {
+        if reload || self.cve_stale() {
             self.cve_refresh();
         }
+        if reload || self.dep_stale() {
+            self.dep_refresh();
+        }
+    }
+
+    /// Cycle the tier filter — server → build → deploy → all. This is the axis
+    /// that used to be faked by splitting npm in two.
+    pub fn cycle_cve_tier(&mut self, dir: i64) {
+        let n = self.cve.tier_count() as i64;
+        if n <= 1 {
+            return;
+        }
+        self.cve_filters.tier = (self.cve_filters.tier as i64 + dir).rem_euclid(n) as usize;
+        self.scroll.insert(PaneId::Cve, usize::MAX);
     }
 
     /// Cycle the ecosystem filter — all → npm → composer → rubygems → all.
@@ -1959,20 +1995,56 @@ impl App {
         if n <= 1 {
             return;
         }
-        self.cve_eco = (self.cve_eco as i64 + dir).rem_euclid(n) as usize;
+        self.cve_filters.eco = (self.cve_filters.eco as i64 + dir).rem_euclid(n) as usize;
         self.scroll.insert(PaneId::Cve, usize::MAX);
     }
 
-    /// Advisories move on the scale of days, and a scan costs 40 API calls —
-    /// half an hour is generous.
+    /// Lower the severity floor — critical+high → +medium → everything. The
+    /// old panel could only ever ask GitHub for critical+high; the registry
+    /// hands over the lot, so the floor is a choice now.
+    pub fn cycle_cve_sev(&mut self) {
+        self.cve_filters.sev = (self.cve_filters.sev + 1) % 3;
+        self.scroll.insert(PaneId::Cve, usize::MAX);
+    }
+
+    /// Hide advisories with nowhere to upgrade to.
+    pub fn toggle_cve_fixable(&mut self) {
+        self.cve_filters.fixable = !self.cve_filters.fixable;
+        self.scroll.insert(PaneId::Cve, usize::MAX);
+    }
+
+    /// A reload can drop a tier or an ecosystem entirely.
+    fn clamp_cve_filters(&mut self) {
+        if self.cve_filters.tier >= self.cve.tier_count() {
+            self.cve_filters.tier = 0;
+        }
+        if self.cve_filters.eco >= self.cve.eco_count() {
+            self.cve_filters.eco = 0;
+        }
+    }
+
+    /// The registry pulls from GitHub on its own schedule and stamps the
+    /// result; our read is cheap, so five minutes keeps `refreshed_at` honest
+    /// without hammering it.
     fn cve_stale(&self) -> bool {
-        self.cve.fetched_at_ms == 0 || now_ms() - self.cve.fetched_at_ms > 30 * 60_000
+        self.cve.fetched_at_ms == 0 || now_ms() - self.cve.fetched_at_ms > 5 * 60_000
+    }
+
+    /// Deploys are ~25 GitHub calls, and a deploy lands maybe hourly.
+    fn dep_stale(&self) -> bool {
+        self.deploys.fetched_at_ms == 0 || now_ms() - self.deploys.fetched_at_ms > 15 * 60_000
     }
 
     fn load_ccache(&mut self) {
         if let Some(c) = crate::gcache::load_cve() {
             if c.fetched_at_ms > self.cve.fetched_at_ms {
                 self.cve = c;
+                self.clamp_cve_filters();
+            }
+        }
+        if let Some(d) = crate::gcache::load_deploys() {
+            if d.fetched_at_ms > self.deploys.fetched_at_ms {
+                self.deploys = d;
             }
         }
     }
@@ -1980,7 +2052,7 @@ impl App {
     pub fn cve_refresh(&mut self) {
         let backoff = self
             .cve_attempt
-            .map(|t| t.elapsed() < Duration::from_secs(20))
+            .map(|t| t.elapsed() < Duration::from_secs(10))
             .unwrap_or(false);
         if self.cve.fetching || backoff {
             return;
@@ -1989,13 +2061,33 @@ impl App {
         self.cve_attempt = Some(Instant::now());
         let tx = self.cve_tx.clone();
         std::thread::spawn(move || {
-            if !crate::gcache::try_lock("cve") {
-                let _ = tx.send(crate::cve::CveState::default());
-                return;
-            }
             let mut st = crate::cve::fetch();
             crate::gcache::store_cve(&st);
-            crate::gcache::unlock("cve");
+            st.fetching = false;
+            let _ = tx.send(st);
+        });
+    }
+
+    pub fn dep_refresh(&mut self) {
+        let backoff = self
+            .dep_attempt
+            .map(|t| t.elapsed() < Duration::from_secs(30))
+            .unwrap_or(false);
+        if self.deploys.fetching || backoff {
+            return;
+        }
+        self.deploys.fetching = true;
+        self.dep_attempt = Some(Instant::now());
+        let tx = self.dep_tx.clone();
+        std::thread::spawn(move || {
+            // the slow half is still worth serialising across instances
+            if !crate::gcache::try_lock("deploys") {
+                let _ = tx.send(crate::cve::DeployState::default());
+                return;
+            }
+            let mut st = crate::cve::fetch_deploys();
+            crate::gcache::store_deploys(&st);
+            crate::gcache::unlock("deploys");
             st.fetching = false;
             let _ = tx.send(st);
         });

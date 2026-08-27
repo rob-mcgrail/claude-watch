@@ -1441,9 +1441,12 @@ fn render_github(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     f.render_widget(Paragraph::new(visible).block(block), rect);
 }
 
-/// Dependabot across the sites registry, plus what has actually shipped.
-/// Rolled up per advisory rather than listed per alert: the same CVE in
-/// fourteen sites is one fix, not fourteen.
+/// Open advisories across the managed sites, read from the registry rather
+/// than scanned out of GitHub. The registry already groups per advisory and
+/// already knows which tier a vulnerable manifest sits in — `server` faces the
+/// internet, `build` never leaves CI — so this panel spends its lines on the
+/// judgement calls instead: what is critical, what is actually being exploited,
+/// and which sites carry the load.
 fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
     app.pane_rects.push((PaneId::Cve, rect));
     let h = inner_h(rect);
@@ -1454,14 +1457,38 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
             Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
         ))
     };
+    let dim = Style::default().fg(Color::DarkGray);
+    let sev_style = |s: &str| match s {
+        "critical" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "high" => Style::default().fg(Color::Yellow),
+        "medium" => Style::default().fg(Color::LightCyan),
+        _ => Style::default().fg(Color::Gray),
+    };
+    // an unscored advisory is not a zero-risk one — say so rather than
+    // printing a 0.0 that reads as "harmless"
+    let cvss = |v: f64| if v > 0.0 { format!("{v:>4.1}") } else { "   —".to_string() };
+    // EPSS is a probability, and the interesting ones are rare: anything past
+    // a few percent is worth a colour of its own
+    let epss = |e: Option<f64>| match e {
+        Some(v) if v >= 0.10 => (
+            format!("{:>4.0}%", v * 100.0),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Some(v) if v >= crate::cve::EPSS_FLOOR => {
+            (format!("{:>4.1}%", v * 100.0), Style::default().fg(Color::Yellow))
+        }
+        Some(v) => (format!("{:>4.1}%", v * 100.0), Style::default().fg(Color::DarkGray)),
+        None => ("   —".to_string(), Style::default().fg(Color::DarkGray)),
+    };
+
     let c = &app.cve;
-    let eco = app.cve_eco;
-    let view = c.filtered(eco, crate::cve::KEEP_CVES, crate::cve::KEEP_SITES);
+    let filters = app.cve_filters;
+    let view = c.filtered(filters, crate::cve::KEEP_CVES, crate::cve::KEEP_SITES);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     if c.fetching && c.fetched_at_ms == 0 {
         lines.push(Line::from(Span::styled(
-            "⋯ scanning the managed sites…".to_string(),
+            "⋯ reading the registry…".to_string(),
             Style::default().fg(Color::Yellow),
         )));
     }
@@ -1471,154 +1498,331 @@ fn render_cve(f: &mut Frame, app: &mut App, rect: Rect, accent: Color) {
             Style::default().fg(Color::Red),
         )));
     }
+    // the registry failing to reach GitHub is different from us failing to
+    // reach the registry: the numbers are still real, just older than claimed
+    if let Some(e) = &c.refresh_error {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ registry's last github pull failed — {}", truncate_chars(e, 90)),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
     if c.fetched_at_ms > 0 {
-        lines.push(Line::from(vec![
+        let mut head = vec![
             Span::styled(
-                format!("  {} critical", view.critical),
+                format!("  {} critical", view.sev_counts[0]),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" · {} high", view.total.saturating_sub(view.critical)),
+                format!(" · {} high", view.sev_counts[1]),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::styled(
-                format!(
-                    " · {} distinct CVEs · {}/{} sites affected",
-                    view.distinct, view.sites_affected, c.sites_scanned
-                ),
+        ];
+        if filters.sev > 0 {
+            head.push(Span::styled(
+                format!(" · {} medium", view.sev_counts[2]),
+                Style::default().fg(Color::LightCyan),
+            ));
+        }
+        if filters.sev > 1 {
+            head.push(Span::styled(
+                format!(" · {} low", view.sev_counts[3]),
                 Style::default().fg(Color::Gray),
+            ));
+        }
+        head.push(Span::styled(
+            format!(
+                " · {}/{} sites · {} advisories · {} alerts",
+                view.sites_affected,
+                if c.sites_total > 0 { c.sites_total } else { view.sites_affected },
+                view.advisories,
+                view.alerts
             ),
-            Span::styled(
-                if c.unreadable > 0 {
-                    format!(" · {} not on github", c.unreadable)
+            Style::default().fg(Color::Gray),
+        ));
+        // nowhere to upgrade to is a different problem from nobody having got
+        // round to it, and it should not hide inside the totals
+        if view.unfixable > 0 && !filters.fixable {
+            head.push(Span::styled(
+                format!(" · {} with no fix", view.unfixable),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        lines.push(Line::from(head));
+
+        // the filters are modes, so they say so even when set to everything
+        let chips = |key: &str, label: &str, opts: Vec<String>, sel: usize| {
+            let mut sp = vec![
+                Span::styled(format!("  {key:<3}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{label:<9}"), Style::default().fg(Color::Gray)),
+            ];
+            for (i, o) in opts.iter().enumerate() {
+                let st = if i == sel {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    String::new()
-                },
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        // the filter is a mode, so it says so even when set to everything
-        let mut chips: Vec<Span> = vec![Span::styled(
-            "  <> ".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )];
-        for i in 0..c.eco_count() {
-            let st = if i == eco {
+                    Style::default().fg(Color::DarkGray)
+                };
+                sp.push(Span::styled(format!(" {o} "), st));
+                sp.push(Span::raw(" "));
+            }
+            Line::from(sp)
+        };
+        lines.push(chips(
+            "<>",
+            "tier",
+            (0..c.tier_count()).map(|i| c.tier_label(i)).collect(),
+            filters.tier,
+        ));
+        lines.push(chips(
+            "e",
+            "ecosystem",
+            (0..c.eco_count()).map(|i| c.eco_label(i)).collect(),
+            filters.eco,
+        ));
+        let mut foot = chips(
+            "x",
+            "severity",
+            (0..3).map(|i| crate::cve::CveState::sev_label(i).to_string()).collect(),
+            filters.sev,
+        )
+        .spans;
+        foot.push(Span::styled("    f  ".to_string(), Style::default().fg(Color::DarkGray)));
+        foot.push(Span::styled(
+            if filters.fixable { " fixable only " } else { " all advisories " }.to_string(),
+            if filters.fixable {
                 Style::default().fg(Color::Black).bg(Color::LightBlue).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
-            };
-            chips.push(Span::styled(format!(" {} ", c.eco_label(i)), st));
-            chips.push(Span::raw(" "));
-        }
-        lines.push(Line::from(chips));
+            },
+        ));
+        lines.push(Line::from(foot));
     }
     lines.push(Line::default());
 
-    lines.push(hdr("── worst CVEs · critical first, then blast radius ──"));
-    if view.worst.is_empty() && c.fetched_at_ms > 0 {
-        lines.push(Line::from(Span::styled(
-            "  · none".to_string(),
+    // criticals get room to explain themselves — there are only ever a handful,
+    // and each one is a decision someone has to make today
+    lines.push(hdr("── critical ──"));
+    if view.critical.is_empty() && c.fetched_at_ms > 0 {
+        lines.push(Line::from(Span::styled("  · none".to_string(), dim)));
+    }
+    for r in &view.critical {
+        let (e_txt, e_st) = epss(r.epss);
+        lines.push(Line::from(vec![
+            Span::styled("  ✗ ".to_string(), sev_style("critical")),
+            Span::styled(
+                format!("{:<18}", truncate_chars(&r.id, 18)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {} ", cvss(r.cvss)), Style::default().fg(Color::Gray)),
+            Span::styled(format!(" {e_txt} "), e_st),
+            Span::styled(
+                format!(" {:<30}", truncate_chars(&r.package, 30)),
+                Style::default().fg(Color::LightCyan),
+            ),
+            Span::styled(
+                format!(" {:>2} {}", r.sites.len(), if r.sites.len() == 1 { "site " } else { "sites" }),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                if r.fixable {
+                    if r.first_patched.is_empty() {
+                        " · fix available".to_string()
+                    } else {
+                        format!(" · fix {}", truncate_chars(&r.first_patched, 14))
+                    }
+                } else {
+                    " · no fix yet".to_string()
+                },
+                if r.fixable {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+                },
+            ),
+        ]));
+        if !r.summary.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", truncate_chars(&r.summary, 130)),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        let mut tail = vec![Span::styled(
+            format!("      {}", truncate_chars(&r.sites.join(", "), 92)),
+            dim,
+        )];
+        // with the tier filter set, every row here is that tier and saying so
+        // is noise; with it off, server-vs-build is the whole judgement
+        if filters.tier >= c.tiers.len() {
+            tail.push(Span::styled(
+                format!("  · {}", r.tiers.join("+")),
+                if r.tiers.iter().any(|t| t == "server") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ));
+        }
+        // which rule or language put it in that tier — the difference between
+        // "this serves users" and "a glob says so"
+        tail.push(Span::styled(
+            if r.scope.is_empty() { String::new() } else { format!("  · {}", r.scope) },
             Style::default().fg(Color::DarkGray),
-        )));
+        ));
+        lines.push(Line::from(tail));
+    }
+    lines.push(Line::default());
+
+    // the one thing the old panel could not have told you: severity ranking
+    // buries the advisories most likely to actually be exploited
+    if !view.exploitable.is_empty() {
+        lines.push(hdr("── most likely to be exploited · EPSS ──"));
+        for r in &view.exploitable {
+            let (e_txt, e_st) = epss(r.epss);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {e_txt}  "), e_st),
+                Span::styled(format!("{:<9}", r.severity), sev_style(&r.severity)),
+                Span::styled(format!("{} ", cvss(r.cvss)), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(" {:<18}", truncate_chars(&r.id, 18)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {:<26}", truncate_chars(&r.package, 26)),
+                    Style::default().fg(Color::LightCyan),
+                ),
+                Span::styled(
+                    format!(" {:>2} {}  ", r.sites.len(), if r.sites.len() == 1 { "site " } else { "sites" }),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::styled(truncate_chars(&r.sites.join(", "), 60), dim),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+
+    lines.push(hdr("── worst · severity, then exploit probability, then blast radius ──"));
+    if view.worst.is_empty() && c.fetched_at_ms > 0 {
+        lines.push(Line::from(Span::styled("  · none".to_string(), dim)));
     }
     for r in &view.worst {
-        let (mark, st) = if r.severity == "critical" {
-            ("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-        } else {
-            ("▲", Style::default().fg(Color::Yellow))
-        };
-        // an unscored advisory is not a zero-risk one — say so rather than
-        // printing a 0.0 that reads as "harmless"
-        let score = if r.cvss > 0.0 {
-            format!("{:>4.1}", r.cvss)
-        } else {
-            "   —".to_string()
-        };
+        let (e_txt, e_st) = epss(r.epss);
         // the ecosystem is redundant once you have filtered to one
-        let pkg = if eco == 0 {
+        let pkg = if filters.eco == 0 {
             format!("{} ({})", r.package, r.ecosystem)
         } else {
             r.package.clone()
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {mark} "), st),
+            Span::styled("  ▲ ".to_string(), sev_style(&r.severity)),
             Span::styled(
                 format!("{:<18}", truncate_chars(&r.id, 18)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {score} "), Style::default().fg(Color::Gray)),
+            Span::styled(format!(" {} ", cvss(r.cvss)), Style::default().fg(Color::Gray)),
+            Span::styled(format!(" {e_txt} "), e_st),
             Span::styled(
-                format!("{:<28}", truncate_chars(&pkg, 28)),
+                format!(" {:<32}", truncate_chars(&pkg, 32)),
                 Style::default().fg(Color::LightCyan),
             ),
             Span::styled(
-                format!(" {:>2} sites", r.sites),
+                format!(" {:>2} {} ", r.sites.len(), if r.sites.len() == 1 { "site " } else { "sites" }),
                 Style::default().fg(Color::Magenta),
             ),
             Span::styled(
-                format!(" · open {}", fmt_dur(now - r.oldest_ms)),
-                Style::default().fg(Color::DarkGray),
+                if r.fixable { " fix " } else { " —   " }.to_string(),
+                if r.fixable {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Magenta)
+                },
             ),
+            Span::styled(format!(" {}", truncate_chars(&r.sites.join(", "), 56)), dim),
         ]));
     }
     lines.push(Line::default());
 
     lines.push(hdr("── worst sites ──"));
-    for (repo, crit, high) in &view.by_site {
-        lines.push(Line::from(vec![
+    if view.by_site.is_empty() && c.fetched_at_ms > 0 {
+        lines.push(Line::from(Span::styled("  · none".to_string(), dim)));
+    }
+    for t in &view.by_site {
+        let mut sp = vec![
             Span::styled(
-                format!("  {:<26}", truncate_chars(repo, 26)),
+                format!("  {:<28}", truncate_chars(&t.repo, 28)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{crit:>4} critical"), Style::default().fg(Color::Red)),
-            Span::styled(format!(" · {high:>4} high"), Style::default().fg(Color::Yellow)),
-        ]));
+            Span::styled(format!("{:>4} critical", t.critical), Style::default().fg(Color::Red)),
+            Span::styled(format!(" · {:>4} high", t.high), Style::default().fg(Color::Yellow)),
+        ];
+        if filters.sev > 0 {
+            sp.push(Span::styled(
+                format!(" · {:>4} lower", t.rest),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        // a site under a proactive SLA is one we have promised to keep patched
+        if t.sla {
+            sp.push(Span::styled("  SLA".to_string(), Style::default().fg(Color::Green)));
+        }
+        lines.push(Line::from(sp));
     }
     lines.push(Line::default());
 
+    let d = &app.deploys;
     lines.push(hdr("── deploy-production · most recent ──"));
-    if c.deploys.is_empty() && c.fetched_at_ms > 0 {
+    if let Some(e) = &d.error {
         lines.push(Line::from(Span::styled(
-            "  · none".to_string(),
+            format!("  ⚠ {}", truncate_chars(e, 110)),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if d.deploys.is_empty() && d.fetched_at_ms == 0 {
+        lines.push(Line::from(Span::styled(
+            "  ⋯ asking github…".to_string(),
             Style::default().fg(Color::DarkGray),
         )));
     }
-    for d in &c.deploys {
+    for dep in &d.deploys {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<26}", truncate_chars(&d.repo, 26)),
+                format!("  {:<28}", truncate_chars(&dep.repo, 28)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:>9} ago", fmt_dur(now - d.when_ms)),
+                format!("{:>9} ago", fmt_dur(now - dep.when_ms)),
                 Style::default().fg(Color::Green),
             ),
             Span::styled(
-                format!(" · {:<16}", truncate_chars(&d.author, 16)),
+                format!(" · {:<16}", truncate_chars(&dep.author, 16)),
                 Style::default().fg(Color::Gray),
             ),
-            Span::styled(
-                format!(" {}", truncate_chars(&d.subject, 58)),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!(" {}", truncate_chars(&dep.subject, 58)), dim),
         ]));
     }
 
-    let updated = match (c.fetching, c.fetched_at_ms) {
-        (true, 0) => "scanning…".to_string(),
-        (true, at) => format!("scanned {} ago · rescanning…", fmt_dur(now - at)),
-        (false, 0) => String::new(),
-        (false, at) => format!("scanned {} ago", fmt_dur(now - at)),
+    // the age that matters is the registry's own last pull from GitHub — our
+    // read of it is only ever seconds old and saying so would flatter the data
+    let updated = match (c.fetching, c.fetched_at_ms, c.refreshed_ms) {
+        (true, 0, _) => "reading…".to_string(),
+        (_, 0, _) => String::new(),
+        (_, _, 0) => "pull time unknown".to_string(),
+        (fetching, _, at) => format!(
+            "github pull {} ago{}",
+            fmt_dur(now - at),
+            if fetching { " · reloading…" } else { "" }
+        ),
     };
     let total = lines.len();
     let (start, end) = window(app, PaneId::Cve, total, h);
     let visible = lines[start..end].to_vec();
-    let filt = app.cve.eco_label(app.cve_eco);
+    let tier = app.cve.tier_label(app.cve_filters.tier);
     let block = pane_block(
         app,
         PaneId::Cve,
-        format!("security · managed sites · {filt} · {updated}"),
+        format!("security · managed sites · {tier} tier · {updated}"),
         accent,
     );
     f.render_widget(Paragraph::new(visible).block(block), rect);
@@ -1883,12 +2087,16 @@ mod tests {
             200_000,
         );
         let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        for layout in [1u8, 2, 3] {
+        // 8 and 9 render from empty registry state — the path a first run hits
+        for (layout, expect) in [(1u8, "activity"), (2, "activity"), (3, "activity"), (8, "security"), (9, "sites")] {
             app.layout = layout;
             term.draw(|f| draw(f, &mut app)).unwrap();
+            let content = format!("{:?}", term.backend().buffer());
+            assert!(content.contains(expect), "layout {layout} missing {expect}");
         }
+        app.layout = 1;
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let content = format!("{:?}", term.backend().buffer());
-        assert!(content.contains("activity"));
         assert!(content.contains("no claude sessions found"));
     }
 }

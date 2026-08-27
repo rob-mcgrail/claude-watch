@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -6,86 +6,58 @@ use serde_json::Value;
 
 use crate::app::{now_ms, truncate_chars};
 
-/// One advisory as it lands across the estate. The org-wide Dependabot endpoint
-/// returns tens of thousands of alerts — most of them against throwaway repos —
-/// so this is scoped to the sites registry and rolled up per advisory: the same
-/// CVE in fourteen sites is one row with a blast radius, not fourteen rows.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CveRollup {
-    pub id: String, // CVE-… , or the GHSA id when no CVE is assigned
-    pub severity: String,
-    pub cvss: f64,
-    pub package: String,
-    pub ecosystem: String,
-    /// Affected site count per filter key. One CVE can span both npm buckets —
-    /// minimist turns up in a Next app and in a SilverStripe theme build — so
-    /// the blast radius is per bucket, not a single number.
-    pub sites_by_key: Vec<(String, usize)>,
-    pub oldest_ms: i64,
-}
+/// Where a vulnerable dependency actually runs, as the registry classifies it.
+///
+/// This is the distinction the old gh-direct scan inferred for itself, by
+/// looking at whether an npm manifest sat inside a composer/rubygems app
+/// directory. The registry now decides it — per-site `depscope` glob rules, the
+/// site's declared languages, the dev-dependency flag — so the heuristic and
+/// its edge cases are gone, and a wrong call is fixed with `sites depscope`
+/// rather than a new release of this binary.
+///
+/// `server` faces the internet. `build` never leaves CI. `deploy` is the
+/// tooling that ships the site (what the old scan called `cap`).
+const TIER_ORDER: [&str; 3] = ["server", "build", "deploy"];
 
-/// A rollup resolved against the current filter.
-#[derive(Clone)]
-pub struct CveRow {
+/// One advisory across the estate. The same CVE in six sites is one row
+/// listing six, which is also how the API groups it — the rollup that used to
+/// happen here now arrives done.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Advisory {
+    /// CVE id where one is assigned, else the GHSA id.
     pub id: String,
+    pub summary: String,
     pub severity: String,
     pub cvss: f64,
-    pub package: String,
-    pub ecosystem: String,
-    pub sites: usize,
-    pub oldest_ms: i64,
+    /// Probability of exploitation in the wild, 0–1. Absent for ~7% of
+    /// advisories — a gap, not a zero, so it stays optional all the way to the
+    /// render.
+    pub epss: Option<f64>,
+    pub published_ms: i64,
+    /// True when a patched version exists. An unfixable critical is a
+    /// different kind of problem from one nobody has got round to.
+    pub fixable: bool,
+    pub alerts: Vec<AlertRef>,
 }
 
-/// npm means two very different things across this estate: the runtime of a
-/// Next/Bun app, or just the webpack/gulp toolchain that precompiles assets for
-/// a Rails or SilverStripe site. A CVE in the first is served to users; in the
-/// second it never leaves the build. `runtime_versions` in the registry is what
-/// separates them, and the manifest paths agree — the build-only sites carry
-/// their lockfiles under themes/ and app/cms/javascript/.
-pub const NPM_SERVED: &str = "npm · served";
-pub const NPM_BUILD: &str = "npm · toolchain";
-/// A Gemfile on a site that does not run Ruby is there to deploy it —
-/// Capistrano and its dependency tree. Worth fixing; not worth alarming about.
-pub const CAP: &str = "cap";
-
-/// The rule of thumb: **an npm tree living inside a Ruby or PHP app directory
-/// is that app's asset pipeline.** A CVE there is webpack/gulp build machinery;
-/// a CVE in a standalone package.json is a Next or Bun app serving users.
-///
-/// It resolves the monorepos without a special case. `consumer` has npm at
-/// `mms/` and `replatform/`, and a Gemfile at `mms/` — so mms is the Rails
-/// theme build and replatform is the react-router app. `powerswitch` has
-/// `gilbert/app/client` under `gilbert/Gemfile.lock`, and `romeo/` standing
-/// alone with next in it. Same rule, both right, and no extra API calls: those
-/// composer and rubygems manifest paths arrive with the alerts.
-///
-/// `roots` are the app directories; "" means the whole repo is one app, which
-/// is the ordinary case for a SilverStripe or Rails site.
-fn npm_is_toolchain(manifest_dir: &str, roots: &[String]) -> bool {
-    roots.iter().any(|r| {
-        r.is_empty() || manifest_dir == r || manifest_dir.starts_with(&format!("{r}/"))
-    })
-}
-
-/// Directory part of `themes/x/package-lock.json`, or "" at the repo root.
-fn dir_of(path: &str) -> String {
-    match path.rfind('/') {
-        Some(i) => path[..i].to_string(),
-        None => String::new(),
-    }
-}
-
-/// Counts per (site, ecosystem) rather than per site, so the ecosystem filter
-/// can re-tally without another scan.
+/// One advisory landing in one manifest of one site.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct SiteEco {
+pub struct AlertRef {
     pub repo: String,
+    pub tier: String,
     pub ecosystem: String,
-    pub critical: usize,
-    pub high: usize,
+    pub package: String,
+    /// Why it landed in that tier — "rule romeo/**", "language php",
+    /// "dev-dependency". Worth showing on a critical: it is the difference
+    /// between "this serves users" and "a glob says so".
+    pub scope: String,
+    pub sla: bool,
+    /// A patched version, where the advisory names one.
+    pub first_patched: String,
 }
 
-/// Head of a repo's deploy-production branch — what actually went out, and when.
+/// Head of a repo's deploy-production branch — what actually went out, and
+/// when. Still GitHub's to answer; the registry does not track it.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Deploy {
     pub repo: String,
@@ -96,40 +68,131 @@ pub struct Deploy {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct CveState {
-    /// Every rollup, not just the visible ones — the ecosystem filter narrows
-    /// this at render time, and re-scanning to change filter would be absurd.
-    pub rollups: Vec<CveRollup>,
-    pub site_eco: Vec<SiteEco>,
-    /// Ecosystems present, most alerts first; the `<`/`>` filter cycles these.
+    /// Every advisory at every tier. The filters narrow this at render time —
+    /// re-fetching to change a filter would be absurd when the whole fleet is
+    /// one 300ms call.
+    pub advisories: Vec<Advisory>,
+    /// Tiers present, in severity-of-exposure order.
+    pub tiers: Vec<String>,
+    /// Ecosystems present, most alerts first.
     pub ecosystems: Vec<String>,
-    pub deploys: Vec<Deploy>,
-    pub sites_scanned: usize,
-    /// Registry entries GitHub would not show us — renamed, deleted, or private
-    /// to this token. Worth a footnote, not a red warning.
+    /// Sites in the registry, for the "N of M affected" denominator.
+    pub sites_total: usize,
+    /// When the registry last pulled from GitHub — the age that matters, since
+    /// our own fetch is just a read of that.
+    pub refreshed_ms: i64,
+    /// The registry's own last-pull complaint, if it had one.
     #[serde(default)]
-    pub unreadable: usize,
+    pub refresh_error: Option<String>,
     #[serde(skip)]
     pub error: Option<String>,
     #[serde(skip)]
     pub fetching: bool,
-    /// Round-trips through the cache — it is what tells another instance
-    /// whether the scan on disk is still worth adopting.
-    #[serde(default)]
     pub fetched_at_ms: i64,
 }
 
-/// What the panel shows for one ecosystem selection.
-pub struct Filtered {
-    pub worst: Vec<CveRow>,
-    pub by_site: Vec<(String, usize, usize)>,
-    pub total: usize,
-    pub critical: usize,
-    pub distinct: usize,
-    pub sites_affected: usize,
+/// Deploy heads live apart from the advisories now: one is a 300ms read of the
+/// registry, the other is ~25 GitHub calls. Sharing a fetch would have made the
+/// fast half wait for the slow one.
+#[derive(Default, Serialize, Deserialize)]
+pub struct DeployState {
+    pub deploys: Vec<Deploy>,
+    #[serde(skip)]
+    pub error: Option<String>,
+    #[serde(skip)]
+    pub fetching: bool,
+    pub fetched_at_ms: i64,
 }
 
+/// The four axes the panel filters on. Tier and ecosystem are orthogonal now —
+/// the old single axis conflated them because the npm split *was* the tier.
+#[derive(Clone, Copy)]
+pub struct Filters {
+    /// Index into `tiers`; `tiers.len()` means every tier.
+    pub tier: usize,
+    /// 0 is every ecosystem, then one per entry in `ecosystems`.
+    pub eco: usize,
+    /// 0 = critical+high, 1 = down to medium, 2 = everything.
+    pub sev: usize,
+    /// Only advisories with a patched version to move to.
+    pub fixable: bool,
+}
+
+impl Default for Filters {
+    fn default() -> Self {
+        // server-tier, critical+high: what faces the internet and would wake
+        // someone up. Everything else is one keystroke away.
+        Self { tier: 0, eco: 0, sev: 0, fixable: false }
+    }
+}
+
+/// An advisory resolved against the current filter — its sites and tiers are
+/// only those that survived it.
+#[derive(Clone)]
+pub struct Row {
+    pub id: String,
+    pub summary: String,
+    pub severity: String,
+    pub cvss: f64,
+    pub epss: Option<f64>,
+    pub published_ms: i64,
+    pub fixable: bool,
+    pub package: String,
+    pub ecosystem: String,
+    pub sites: Vec<String>,
+    pub tiers: Vec<String>,
+    pub scope: String,
+    pub first_patched: String,
+}
+
+#[derive(Clone)]
+pub struct SiteTally {
+    pub repo: String,
+    pub critical: usize,
+    pub high: usize,
+    pub rest: usize,
+    pub sla: bool,
+}
+
+pub struct Filtered {
+    /// Criticals get the expanded treatment — there are only ever a handful,
+    /// and each one is a decision.
+    pub critical: Vec<Row>,
+    pub worst: Vec<Row>,
+    /// Ranked by EPSS rather than severity. This is the section the old panel
+    /// could not have had: the fleet's most-likely-to-be-exploited advisory is
+    /// a *medium*, and severity ranking buries it forever.
+    pub exploitable: Vec<Row>,
+    pub by_site: Vec<SiteTally>,
+    pub advisories: usize,
+    pub alerts: usize,
+    pub sev_counts: [usize; 4],
+    pub sites_affected: usize,
+    pub unfixable: usize,
+}
+
+fn sev_rank(s: &str) -> usize {
+    match s {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        _ => 3,
+    }
+}
+
+/// EPSS below this is noise; above it, worth saying out loud.
+pub const EPSS_FLOOR: f64 = 0.01;
+
 impl CveState {
-    /// Label for a filter index: 0 is everything, then one per ecosystem.
+    pub fn tier_label(&self, idx: usize) -> String {
+        self.tiers.get(idx).cloned().unwrap_or_else(|| "all".to_string())
+    }
+
+    /// One past the last tier is "all tiers".
+    pub fn tier_count(&self) -> usize {
+        self.tiers.len() + 1
+    }
+
     pub fn eco_label(&self, idx: usize) -> String {
         if idx == 0 {
             "all".to_string()
@@ -142,164 +205,318 @@ impl CveState {
         self.ecosystems.len() + 1
     }
 
-    /// Re-derive the visible rows for one ecosystem selection. Cheap enough to
-    /// run every frame: a few hundred rollups and a few dozen tallies.
-    pub fn filtered(&self, idx: usize, keep_cves: usize, keep_sites: usize) -> Filtered {
-        let eco = (idx > 0).then(|| self.eco_label(idx));
-        let keep = |e: &str| eco.as_deref().map(|f| f == e).unwrap_or(true);
-
-        // the blast radius depends on the filter, so the ranking has to be
-        // recomputed with it rather than reused from the scan
-        let mut worst: Vec<CveRow> = self
-            .rollups
-            .iter()
-            .filter_map(|r| {
-                let sites: usize =
-                    r.sites_by_key.iter().filter(|(k, _)| keep(k)).map(|(_, n)| n).sum();
-                (sites > 0).then(|| CveRow {
-                    id: r.id.clone(),
-                    severity: r.severity.clone(),
-                    cvss: r.cvss,
-                    package: r.package.clone(),
-                    ecosystem: r.ecosystem.clone(),
-                    sites,
-                    oldest_ms: r.oldest_ms,
-                })
-            })
-            .collect();
-        worst.sort_by(|a, b| {
-            let rank = |s: &str| if s == "critical" { 0 } else { 1 };
-            rank(&a.severity)
-                .cmp(&rank(&b.severity))
-                .then(b.sites.cmp(&a.sites))
-                .then(b.cvss.total_cmp(&a.cvss))
-                .then(a.oldest_ms.cmp(&b.oldest_ms))
-        });
-        let distinct = worst.len();
-        worst.truncate(keep_cves);
-
-        let mut tally: HashMap<&str, (usize, usize)> = HashMap::new();
-        for s in self.site_eco.iter().filter(|s| keep(&s.ecosystem)) {
-            let e = tally.entry(s.repo.as_str()).or_insert((0, 0));
-            e.0 += s.critical;
-            e.1 += s.high;
+    pub fn sev_label(idx: usize) -> &'static str {
+        match idx {
+            0 => "critical+high",
+            1 => "+medium",
+            _ => "everything",
         }
-        let critical: usize = tally.values().map(|(c, _)| c).sum();
-        let high: usize = tally.values().map(|(_, h)| h).sum();
-        let sites_affected = tally.values().filter(|(c, h)| c + h > 0).count();
-        let mut by_site: Vec<(String, usize, usize)> =
-            tally.into_iter().map(|(r, (c, h))| (r.to_string(), c, h)).collect();
-        by_site.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+    }
+
+    /// Re-derive everything the panel shows for one filter selection. A couple
+    /// of hundred advisories and ~1200 alerts — cheap enough per frame.
+    pub fn filtered(&self, f: Filters, keep: usize, keep_sites: usize) -> Filtered {
+        let tier = (f.tier < self.tiers.len()).then(|| self.tiers[f.tier].clone());
+        let eco = (f.eco > 0).then(|| self.eco_label(f.eco));
+        let keep_alert = |a: &AlertRef| {
+            tier.as_deref().map(|t| t == a.tier).unwrap_or(true)
+                && eco.as_deref().map(|e| e == a.ecosystem).unwrap_or(true)
+        };
+        let sev_floor = match f.sev {
+            0 => 1, // critical + high
+            1 => 2, // …and medium
+            _ => 3,
+        };
+
+        let mut rows: Vec<Row> = Vec::new();
+        let mut alerts = 0usize;
+        let mut sev_counts = [0usize; 4];
+        let mut unfixable = 0usize;
+        let mut tally: HashMap<&str, SiteTally> = HashMap::new();
+
+        for adv in &self.advisories {
+            if sev_rank(&adv.severity) > sev_floor {
+                continue;
+            }
+            if f.fixable && !adv.fixable {
+                continue;
+            }
+            let hits: Vec<&AlertRef> = adv.alerts.iter().filter(|a| keep_alert(a)).collect();
+            if hits.is_empty() {
+                continue;
+            }
+            alerts += hits.len();
+            sev_counts[sev_rank(&adv.severity)] += 1;
+            if !adv.fixable {
+                unfixable += 1;
+            }
+
+            // a site reached through two manifests is still one site
+            let mut sites: Vec<String> = hits.iter().map(|a| a.repo.clone()).collect();
+            sites.sort();
+            sites.dedup();
+            let mut tiers: Vec<String> = hits.iter().map(|a| a.tier.clone()).collect();
+            tiers.sort_by_key(|t| TIER_ORDER.iter().position(|x| x == t).unwrap_or(9));
+            tiers.dedup();
+
+            for a in &hits {
+                let e = tally.entry(a.repo.as_str()).or_insert_with(|| SiteTally {
+                    repo: a.repo.clone(),
+                    critical: 0,
+                    high: 0,
+                    rest: 0,
+                    sla: false,
+                });
+                match sev_rank(&adv.severity) {
+                    0 => e.critical += 1,
+                    1 => e.high += 1,
+                    _ => e.rest += 1,
+                }
+                e.sla |= a.sla;
+            }
+
+            let first = hits[0];
+            rows.push(Row {
+                id: adv.id.clone(),
+                summary: adv.summary.clone(),
+                severity: adv.severity.clone(),
+                cvss: adv.cvss,
+                epss: adv.epss,
+                published_ms: adv.published_ms,
+                fixable: adv.fixable,
+                package: first.package.clone(),
+                ecosystem: first.ecosystem.clone(),
+                sites,
+                tiers,
+                scope: first.scope.clone(),
+                first_patched: hits
+                    .iter()
+                    .map(|a| a.first_patched.as_str())
+                    .find(|v| !v.is_empty())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+
+        let advisories = rows.len();
+        let sites_affected = tally.len();
+
+        // severity is how anyone triages, so it leads; EPSS breaks ties ahead
+        // of blast radius because a likely exploit on one site beats an
+        // improbable one on three
+        let mut worst = rows.clone();
+        worst.sort_by(|a, b| {
+            sev_rank(&a.severity)
+                .cmp(&sev_rank(&b.severity))
+                .then(b.epss.unwrap_or(0.0).total_cmp(&a.epss.unwrap_or(0.0)))
+                .then(b.sites.len().cmp(&a.sites.len()))
+                .then(b.cvss.total_cmp(&a.cvss))
+                .then(a.published_ms.cmp(&b.published_ms))
+        });
+
+        let critical: Vec<Row> =
+            worst.iter().filter(|r| r.severity == "critical").cloned().collect();
+        // the criticals have their own expanded block above; no point printing
+        // them twice
+        worst.retain(|r| r.severity != "critical");
+        worst.truncate(keep);
+
+        let mut exploitable: Vec<Row> = rows
+            .iter()
+            .filter(|r| r.epss.unwrap_or(0.0) >= EPSS_FLOOR && r.severity != "critical")
+            .cloned()
+            .collect();
+        exploitable.sort_by(|a, b| {
+            b.epss.unwrap_or(0.0)
+                .total_cmp(&a.epss.unwrap_or(0.0))
+                .then(sev_rank(&a.severity).cmp(&sev_rank(&b.severity)))
+        });
+        exploitable.truncate(KEEP_EPSS);
+
+        let mut by_site: Vec<SiteTally> = tally.into_values().collect();
+        by_site.sort_by(|a, b| {
+            b.critical
+                .cmp(&a.critical)
+                .then(b.high.cmp(&a.high))
+                .then(b.rest.cmp(&a.rest))
+                .then(a.repo.cmp(&b.repo))
+        });
         by_site.truncate(keep_sites);
 
         Filtered {
-            worst,
-            by_site,
-            total: critical + high,
             critical,
-            distinct,
+            worst,
+            exploitable,
+            by_site,
+            advisories,
+            alerts,
+            sev_counts,
             sites_affected,
+            unfixable,
         }
     }
 }
 
 /// How many rows each section keeps.
-pub const KEEP_CVES: usize = 25;
+pub const KEEP_CVES: usize = 30;
 pub const KEEP_SITES: usize = 15;
+pub const KEEP_EPSS: usize = 6;
 const KEEP_DEPLOYS: usize = 12;
-/// Concurrent `gh` subprocesses. Eight scans the whole registry in ~15s; more
-/// only trades memory for GitHub's secondary rate limiter.
+/// Concurrent `gh` subprocesses for the deploy heads. Only the deploy scan
+/// still talks to GitHub at all.
 const FANOUT: usize = 8;
-
-fn strs(v: &Value, key: &str) -> Vec<String> {
-    v.get(key)
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
-        .unwrap_or_default()
-}
 
 fn parse_flex_ms(t: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(t)
         .map(|d| d.timestamp_millis())
+        // the registry stamps "YYYY-MM-DD HH:MM:SS" in UTC, without a zone
+        .or_else(|_| {
+            chrono::DateTime::parse_from_rfc3339(&format!("{}Z", t.replace(' ', "T")))
+                .map(|d| d.timestamp_millis())
+        })
         .unwrap_or(0)
 }
 
-/// `git@github.com:haunt-digital/foo.git` / `https://github.com/haunt-digital/foo`
-/// → `haunt-digital`. The registry is one org today, but the owner is data.
-fn owner_of(repo_url: &str) -> Option<String> {
-    let after_host = repo_url
-        .rsplit_once("github.com")
-        .map(|(_, rest)| rest.trim_start_matches([':', '/']))?;
-    after_host.split('/').next().map(str::to_string)
+fn s(v: &Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or_default().to_string()
 }
 
-pub struct Site {
-    pub owner: String,
-    pub repo: String,
-    /// Runs PHP or Ruby in production, so an npm tree here may be a build step.
-    pub server_side: bool,
-}
-
-/// The managed sites. Anything not in this registry is a throwaway as far as
-/// this panel is concerned.
-fn registry() -> Result<Vec<Site>, String> {
+fn sites_json(args: &[&str]) -> Result<Value, String> {
     let out = Command::new("sites")
-        .args(["list", "--json"])
+        .args(args)
         .output()
         .map_err(|_| "sites: CLI not installed".to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(truncate_chars(&err, 120));
     }
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("sites: bad json ({e})"))?;
-    let empty = vec![];
-    Ok(v
-        .as_array()
-        .unwrap_or(&empty)
-        .iter()
-        .filter_map(|s| {
-            let repo = s.get("repo_name").and_then(|x| x.as_str())?.to_string();
-            let owner = s
-                .get("repo_url")
-                .and_then(|x| x.as_str())
-                .and_then(owner_of)
-                .unwrap_or_else(|| "haunt-digital".to_string());
-            let starts = |xs: &[String], ps: &[&str]| {
-                xs.iter().any(|v| ps.iter().any(|p| v.starts_with(p)))
-            };
-            // stack_tags is the fallback for sites with no recorded versions
-            let server_side = starts(&strs(s, "runtime_versions"), &["php", "ruby", "python"])
-                || starts(&strs(s, "stack_tags"), &["php", "silverstripe", "rails", "ruby"]);
-            Some(Site { owner, repo, server_side })
-        })
-        .collect())
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("sites: bad json ({e})"))
 }
 
-/// severity, cvss, id, ecosystem, package, created — TSV keeps the payload
-/// small, since the full advisory bodies run to several KB each.
-const JQ_ALERTS: &str = ".[] | [\
-    .security_advisory.severity, \
-    ((.security_advisory.cvss.score // 0) as $v3 | if $v3 > 0 then $v3 else (.security_advisory.cvss_severities.cvss_v4.score // 0) end), \
-    (.security_advisory.cve_id // .security_advisory.ghsa_id), \
-    .dependency.package.ecosystem, \
-    .dependency.package.name, \
-    .created_at, \
-    (.dependency.manifest_path // \"\")\
-    ] | @tsv";
+/// One read of the registry's advisory view. `--tooling` is a strict superset
+/// of the default server-only answer — every server alert is present, plus the
+/// build and deploy ones — so the tier filter can run locally off one call
+/// instead of a subprocess per keystroke.
+///
+/// Risk-accepted alerts stay hidden: the registry has already had that
+/// argument, and re-litigating it in a dashboard would be rude.
+pub fn fetch() -> CveState {
+    let mut st = CveState::default();
+    let v = match sites_json(&["cves", "--tooling", "--json"]) {
+        Ok(v) => v,
+        Err(e) => {
+            st.error = Some(e);
+            st.fetched_at_ms = now_ms();
+            return st;
+        }
+    };
+
+    st.refreshed_ms = parse_flex_ms(&s(&v, "refreshed_at"));
+    if v.get("refresh_ok").and_then(|x| x.as_bool()) == Some(false) {
+        let e = s(&v, "refresh_error");
+        st.refresh_error = Some(if e.is_empty() {
+            "registry could not reach github".to_string()
+        } else {
+            truncate_chars(&e, 110)
+        });
+    }
+    // the registry has never pulled at all — a real state, and not one to
+    // report as a healthy zero
+    if v.get("configured").and_then(|x| x.as_bool()) == Some(false) {
+        st.error = Some("sites: dependabot not configured for this org".to_string());
+    }
+
+    let empty = vec![];
+    let groups = ["critical", "other"];
+    for g in groups {
+        for a in v.get(g).and_then(|x| x.as_array()).unwrap_or(&empty) {
+            let ghsa = s(a, "ghsa_id");
+            let cve = s(a, "cve_id");
+            let id = if cve.is_empty() { ghsa } else { cve };
+            if id.is_empty() {
+                continue;
+            }
+            let alerts: Vec<AlertRef> = a
+                .get("alerts")
+                .and_then(|x| x.as_array())
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|al| {
+                    let repo = s(al, "repo_name");
+                    if repo.is_empty() {
+                        return None;
+                    }
+                    let reason = s(al, "scope_reason");
+                    let detail = s(al, "scope_detail");
+                    Some(AlertRef {
+                        repo,
+                        tier: s(al, "tier"),
+                        ecosystem: s(al, "ecosystem"),
+                        package: s(al, "package_name"),
+                        scope: match (reason.as_str(), detail.as_str()) {
+                            ("", _) => String::new(),
+                            (r, "") => r.to_string(),
+                            (r, d) => format!("{r} {d}"),
+                        },
+                        sla: al
+                            .get("under_proactive_sla")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        first_patched: s(al, "first_patched"),
+                    })
+                })
+                .collect();
+            if alerts.is_empty() {
+                continue;
+            }
+            st.advisories.push(Advisory {
+                id,
+                summary: s(a, "summary"),
+                severity: s(a, "severity"),
+                cvss: a.get("cvss_score").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                epss: a.get("epss").and_then(|x| x.as_f64()),
+                published_ms: parse_flex_ms(&s(a, "published_at")),
+                fixable: a.get("fixable").and_then(|x| x.as_bool()).unwrap_or(false),
+                alerts,
+            });
+        }
+    }
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for a in &st.advisories {
+        for al in &a.alerts {
+            seen.insert(al.tier.as_str());
+        }
+    }
+    st.tiers = TIER_ORDER
+        .iter()
+        .filter(|t| seen.contains(**t))
+        .map(|t| t.to_string())
+        .collect();
+
+    let mut eco_alerts: HashMap<&str, usize> = HashMap::new();
+    for a in &st.advisories {
+        for al in &a.alerts {
+            *eco_alerts.entry(al.ecosystem.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut ecos: Vec<(&str, usize)> = eco_alerts.into_iter().collect();
+    ecos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    st.ecosystems = ecos.into_iter().map(|(e, _)| e.to_string()).collect();
+
+    // the denominator for "N of M sites affected"
+    st.sites_total = sites_json(&["list", "--json"])
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+
+    st.fetched_at_ms = now_ms();
+    st
+}
 
 const JQ_BRANCH: &str = "[.commit.commit.committer.date, \
     (.commit.commit.author.name // \"\"), \
     (.commit.commit.message | split(\"\\n\")[0])] | @tsv";
-
-struct Alert {
-    severity: String,
-    cvss: f64,
-    id: String,
-    ecosystem: String,
-    package: String,
-    created_ms: i64,
-    manifest_path: String,
-}
 
 fn gh_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let out = Command::new("gh")
@@ -309,36 +526,16 @@ fn gh_lines(args: &[&str]) -> Result<Vec<String>, String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect())
+    Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
 }
 
-/// Open critical+high alerts for one repo. A repo with Dependabot disabled (or
-/// no alerts) simply yields none — that is not an error worth surfacing.
-fn repo_alerts(owner: &str, repo: &str) -> Result<Vec<Alert>, String> {
-    let path = format!(
-        "/repos/{owner}/{repo}/dependabot/alerts?state=open&severity=critical,high&per_page=100"
-    );
-    Ok(gh_lines(&["api", "--paginate", &path, "--jq", JQ_ALERTS])?
-        .iter()
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 6 {
-                return None;
-            }
-            Some(Alert {
-                severity: f[0].to_string(),
-                cvss: f[1].parse().unwrap_or(0.0),
-                id: f[2].to_string(),
-                ecosystem: f[3].to_string(),
-                package: f[4].to_string(),
-                created_ms: parse_flex_ms(f[5]),
-                manifest_path: f.get(6).unwrap_or(&"").to_string(),
-            })
-        })
-        .collect())
+/// `git@github.com:haunt-digital/foo.git` → `haunt-digital`. One org today,
+/// but the owner is data.
+fn owner_of(repo_url: &str) -> Option<String> {
+    let after_host = repo_url
+        .rsplit_once("github.com")
+        .map(|(_, rest)| rest.trim_start_matches([':', '/']))?;
+    after_host.split('/').next().map(str::to_string)
 }
 
 /// Head of deploy-production, or None when the repo has no such branch. The
@@ -359,153 +556,48 @@ fn repo_deploy(owner: &str, repo: &str) -> Option<Deploy> {
     })
 }
 
-/// Blocking scan of every registered site — background thread only, ~15s.
-pub fn fetch() -> CveState {
-    let mut st = CveState::default();
-    let sites = match registry() {
-        Ok(s) => s,
+/// What has actually shipped. ~25 GitHub calls, so it runs on its own thread
+/// and its own cadence — the advisories no longer wait on it.
+pub fn fetch_deploys() -> DeployState {
+    let mut st = DeployState::default();
+    let v = match sites_json(&["list", "--json"]) {
+        Ok(v) => v,
         Err(e) => {
             st.error = Some(e);
+            st.fetched_at_ms = now_ms();
             return st;
         }
     };
-    st.sites_scanned = sites.len();
+    let empty = vec![];
+    let repos: Vec<(String, String)> = v
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|s| {
+            let repo = s.get("repo_name").and_then(|x| x.as_str())?.to_string();
+            let owner = s
+                .get("repo_url")
+                .and_then(|x| x.as_str())
+                .and_then(owner_of)
+                .unwrap_or_else(|| "haunt-digital".to_string());
+            Some((owner, repo))
+        })
+        .collect();
 
-    // chunked fan-out: the whole registry at once would be 40 concurrent
-    // subprocesses, and GitHub starts pushing back well before that helps.
-    // Alerts and the deploy head share a thread, so this is one pass, not two.
-    type Scan = (String, bool, Result<Vec<Alert>, String>, Option<Deploy>);
-    let mut scans: Vec<Scan> = Vec::new();
-    for chunk in sites.chunks(FANOUT) {
+    for chunk in repos.chunks(FANOUT) {
         let handles: Vec<_> = chunk
             .iter()
-            .map(|site| {
-                let (owner, repo, server_side) =
-                    (site.owner.clone(), site.repo.clone(), site.server_side);
-                std::thread::spawn(move || {
-                    let alerts = repo_alerts(&owner, &repo);
-                    let deploy = repo_deploy(&owner, &repo);
-                    (repo, server_side, alerts, deploy)
-                })
+            .map(|(owner, repo)| {
+                let (owner, repo) = (owner.clone(), repo.clone());
+                std::thread::spawn(move || repo_deploy(&owner, &repo))
             })
             .collect();
         for h in handles {
-            if let Ok(s) = h.join() {
-                scans.push(s);
+            if let Ok(Some(d)) = h.join() {
+                st.deploys.push(d);
             }
         }
     }
-
-    let mut rollups: HashMap<String, CveRollup> = HashMap::new();
-    // (cve, filter key) -> sites, deduped: one CVE can reach a site through two
-    // manifests and that is still one site
-    let mut cve_sites: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut eco_alerts: HashMap<String, usize> = HashMap::new();
-    for (repo, server_side, alerts, deploy) in &scans {
-        if let Some(d) = deploy {
-            st.deploys.push(d.clone());
-        }
-        let alerts = match alerts {
-            Ok(a) => a,
-            // a repo the registry knows and GitHub does not is drift, not a
-            // failure; anything else (auth, rate limit) is worth showing
-            Err(e) => {
-                if e.contains("404") || e.contains("Not Found") {
-                    st.unreadable += 1;
-                } else {
-                    st.error = Some(truncate_chars(e, 110));
-                }
-                continue;
-            }
-        };
-        // where the Ruby/PHP apps live in this repo, from their own manifests.
-        // Only worth looking on a site the registry says actually runs one:
-        // a Next or Bun repo can carry a root Gemfile for deploy tooling, and
-        // that must not turn its whole npm tree into "build only".
-        let mut roots: Vec<String> = if *server_side {
-            alerts
-                .iter()
-                .filter(|a| matches!(a.ecosystem.as_str(), "composer" | "rubygems"))
-                .map(|a| dir_of(&a.manifest_path))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        roots.sort();
-        roots.dedup();
-        // an app in a subdirectory means the repo root is scaffolding, not a
-        // third app — otherwise a root deploy Gemfile would swallow the lot
-        if roots.len() > 1 {
-            roots.retain(|r| !r.is_empty());
-        }
-        // a server-side site with no located app is one app filling the repo —
-        // the ordinary single-app SilverStripe or Rails layout
-        if roots.is_empty() && *server_side {
-            roots.push(String::new());
-        }
-
-        let mut per_eco: HashMap<String, (usize, usize)> = HashMap::new();
-        for a in alerts {
-            let key = match a.ecosystem.as_str() {
-                "npm" => if npm_is_toolchain(&dir_of(&a.manifest_path), &roots) {
-                    NPM_BUILD
-                } else {
-                    NPM_SERVED
-                }
-                .to_string(),
-                // same rule the other way round: a Ruby or PHP manifest with no
-                // app around it is deploy tooling, not the application
-                "rubygems" | "composer" if !*server_side => CAP.to_string(),
-                e => e.to_string(),
-            };
-            let e = per_eco.entry(key.clone()).or_insert((0, 0));
-            if a.severity == "critical" {
-                e.0 += 1;
-            } else {
-                e.1 += 1;
-            }
-            *eco_alerts.entry(key.clone()).or_insert(0) += 1;
-
-            let r = rollups.entry(a.id.clone()).or_insert_with(|| CveRollup {
-                id: a.id.clone(),
-                severity: a.severity.clone(),
-                cvss: a.cvss,
-                package: a.package.clone(),
-                ecosystem: a.ecosystem.clone(),
-                sites_by_key: Vec::new(),
-                oldest_ms: a.created_ms,
-            });
-            r.cvss = r.cvss.max(a.cvss);
-            r.oldest_ms = r.oldest_ms.min(a.created_ms);
-            cve_sites
-                .entry((a.id.clone(), key))
-                .or_default()
-                .push(repo.clone());
-        }
-        for (eco, (critical, high)) in per_eco {
-            st.site_eco.push(SiteEco {
-                repo: repo.clone(),
-                ecosystem: eco,
-                critical,
-                high,
-            });
-        }
-    }
-
-    for ((id, key), mut repos) in cve_sites {
-        repos.sort();
-        repos.dedup();
-        if let Some(r) = rollups.get_mut(&id) {
-            r.sites_by_key.push((key, repos.len()));
-        }
-    }
-    // ranking depends on the active filter, so `filtered` does the sorting
-    st.rollups = rollups.into_values().collect();
-
-    let mut ecos: Vec<(String, usize)> = eco_alerts.into_iter().collect();
-    ecos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    st.ecosystems = ecos.into_iter().map(|(e, _)| e).collect();
-
     st.deploys.sort_by_key(|d| -d.when_ms);
     st.deploys.truncate(KEEP_DEPLOYS);
     st.fetched_at_ms = now_ms();

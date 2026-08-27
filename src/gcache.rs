@@ -96,6 +96,23 @@ pub fn store_cve(st: &crate::cve::CveState) {
     }
 }
 
+/// Deploy heads cache separately from the advisories: they are the slow half
+/// and they go stale on a different clock.
+pub fn load_deploys() -> Option<crate::cve::DeployState> {
+    let txt = fs::read_to_string(dir().join("deploys.json")).ok()?;
+    serde_json::from_str(&txt).ok()
+}
+
+pub fn store_deploys(st: &crate::cve::DeployState) {
+    let _ = fs::create_dir_all(dir());
+    if let Ok(json) = serde_json::to_string(st) {
+        let tmp = dir().join("deploys.json.tmp");
+        if fs::write(&tmp, json).is_ok() {
+            let _ = fs::rename(&tmp, dir().join("deploys.json"));
+        }
+    }
+}
+
 /// The sites registry caches whole — it is one cheap CLI call, cached only so
 /// the panel opens instantly.
 pub fn load_sites() -> Option<crate::sitelist::SitesState> {

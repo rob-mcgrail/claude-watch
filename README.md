@@ -36,13 +36,17 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 
 `Space` toggles between the two modes while you are on `g`; it is a modifier on that pane, not a way into it, so it does nothing from any other view. Both modes are warmed on startup and the one you are not looking at is kept warm while the pane is open, so switching either way renders instantly from data already in hand — never a reload. Anything still in flight sorts to the top of its section. Each source degrades gracefully to a one-line notice if its CLI is missing or unauthenticated.
 
-`s` **security** — every open critical and high Dependabot alert across the sites registry, rolled up per advisory. The org-wide endpoint returns 17,000+ alerts, most of them against throwaway repos, so the scope is `sites list` — the 40 sites Haunt actually maintains. Ranked critical first, then by blast radius: the same CVE in fourteen sites is one row and one fix, not fourteen. `<` and `>` filter by ecosystem, and npm is split by what it actually does at each site:
+`s` **security** — open Dependabot advisories across the sites registry, read from `sites cves` rather than scanned out of GitHub. The registry groups per advisory (the same CVE in fourteen sites is one row and one fix, not fourteen) and, more usefully, already knows which **tier** each vulnerable manifest sits in:
 
-  - **npm · served** — Next, Bun and Gatsby apps, where the dependency is running in front of users.
-  - **npm · toolchain** — the webpack/gulp tree that precompiles theme assets for a Rails or SilverStripe site. It never leaves the build.
-  - **cap** — a Gemfile on a site that does not run Ruby, i.e. Capistrano and its dependencies.
+  - **server** — the dependency runs in front of users.
+  - **build** — the webpack/gulp tree that precompiles theme assets, or anything flagged a dev-dependency. It never leaves CI.
+  - **deploy** — the tooling that ships the site, i.e. Capistrano and its dependency tree.
 
-  The rule is one line: *a manifest living inside a Ruby or PHP app directory belongs to that app's pipeline; one standing on its own is an app in its own right.* The app directories come free with the scan — they are the paths of the composer and rubygems manifests. It resolves the monorepos without special cases: `consumer` has a Gemfile at `mms/`, so `mms/yarn.lock` is the Rails theme build while `replatform/` is the react-router app; `powerswitch` has `gilbert/app/client` under `gilbert/Gemfile.lock` and `romeo/` standing alone with Next in it. Both sites appear in both buckets, correctly. The split is worth having: of 326 open criticals, 40 are in served npm and 284 are build toolchain. Below that, the worst sites by critical count, and the most recent pushes to each site's `deploy-production` branch. A full scan is ~15 seconds across 40 repos; it is preloaded at startup, cached for 30 minutes and shared between instances, and pressing `s` again while it is showing forces a rescan.
+  This replaces the manifest-path heuristic earlier versions used to guess the same thing. The registry decides it from per-site `depscope` glob rules and each site's declared languages, so the monorepos resolve as data rather than as inference — `powerswitch`'s `romeo/**` is server-tier because a rule says so — and a wrong call is fixed with `sites depscope`, not a new release of this binary.
+
+  Four filters, all local to one already-fetched payload: `<`/`>` cycle the tier (server first, since that is what faces the internet), `e` the ecosystem, `x` the severity floor (critical+high, then medium, then everything — the old panel could only ever ask for critical+high), and `f` hides advisories with no fix to move to. Criticals get an expanded block with the advisory summary, the affected sites, the patched version and the rule that put them in their tier. Below that, **most likely to be exploited** ranks by EPSS instead of severity, which is the one thing the old panel could not do: the fleet's most-exploitable advisory is a *medium*, and severity ranking buries it forever. Then the worst sites, with a marker for the ones under a proactive SLA.
+
+  The whole fleet is one ~300ms call, so it is effectively instant and re-reads every five minutes; the title bar shows the age of the registry's own last GitHub pull, not ours, since that is the number that can actually be stale. The `deploy-production` heads below are the only thing still asking GitHub directly — ~25 calls on their own thread and their own clock, so the advisories never wait for them.
 
 `m` **sites** — the registry as a patching work queue: least recently patched first, with the facts that decide whether a stale site is urgent — stack and runtime versions, runtime EOL (flagged red once passed), proactive SLA, and whether it has tests. Same contract as `s`: preloaded, cached, and `m` again reloads it.
 
@@ -83,7 +87,7 @@ Number keys switch views — plus `0` for the machine-wide session switcher and 
 |-----|--------|
 | `0`–`6`, `g` | switch view (`0` sessions machine-wide, `g` github + haunt live) |
 | `Space` | on `g` only: toggle between the live feed and the 10-day digest |
-| `s` | security: open critical/high CVEs across the managed sites (`<`/`>` filter by ecosystem) |
+| `s` | security: open CVEs across the managed sites (`<`/`>` tier · `e` ecosystem · `x` severity · `f` fixable) |
 | `m` | sites registry, least recently patched first |
 | `Tab` / `Shift-Tab` | cycle sessions for this folder (worktree sessions included) |
 | `↑` `↓` `Enter` | on view `0`: select a session and open it |
